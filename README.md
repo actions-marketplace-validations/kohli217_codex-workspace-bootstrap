@@ -2,6 +2,8 @@
 
 Make Windows repositories **Codex-ready** with automated environment checks, project instructions, safety audits, and maintainer workflows.
 
+[日本語ガイド](docs/README.ja.md)
+
 ## Why this exists
 
 Codex works best when a repository is explicit about its toolchain, commands, constraints, and contribution workflow. On Windows, those details are often scattered across README files, local shell history, and machine-specific assumptions.
@@ -22,7 +24,23 @@ Early public release. The project is intentionally small, auditable, and easy to
 
 ## Quick start
 
-### Option A: run from source
+### One-command install on Windows
+
+From PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/kohli217/codex-workspace-bootstrap/main/scripts/install.ps1 | iex
+```
+
+Then:
+
+```powershell
+codex-workspace-bootstrap audit .
+```
+
+If your PowerShell policy blocks remote scripts, use the source install below instead.
+
+### Install from source
 
 ```powershell
 git clone https://github.com/kohli217/codex-workspace-bootstrap.git
@@ -31,7 +49,7 @@ py -m pip install -e .
 codex-workspace-bootstrap audit .
 ```
 
-### Option B: without installing
+### Run without installing
 
 ```powershell
 py -m codex_workspace_bootstrap audit .
@@ -114,12 +132,7 @@ See [AGENTS.md](AGENTS.md) for the instructions used when Codex works on this re
 
 ## Roadmap
 
-- richer language/toolchain detection
-- GitHub Actions workflow generation
-- project-specific AGENTS.md templates
-- optional OpenAI API-assisted instruction drafting
-- Windows environment repair suggestions
-- repository security checks suitable for OSS maintainers
+See [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Contributing
 
