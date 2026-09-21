@@ -93,3 +93,63 @@ def test_markdown_report_is_human_readable(tmp_path: Path) -> None:
     assert "# AI Repository Preflight" in markdown
     assert "**State:** READY" in markdown
     assert "Codex / OpenAI agents" in markdown
+
+
+def test_readiness_needs_attention_with_only_scoped_instruction() -> None:
+    from codex_workspace_bootstrap.preflight import InstructionSignal
+
+    checks = [
+        Check("git-repository", "pass", "ok"),
+        Check("readme", "pass", "ok"),
+        Check("gitignore", "pass", "ok"),
+        Check("project-manifest", "pass", "ok"),
+    ]
+
+    scoped = InstructionSignal(
+        "GitHub Copilot",
+        ".github/instructions/python.instructions.md",
+        "services/api",
+        "path-specific",
+    )
+
+    assert readiness_state(checks, [scoped]) == "NEEDS ATTENTION"
+
+
+def test_root_prefix_path_specific_rule_is_not_repository_wide() -> None:
+    from codex_workspace_bootstrap.preflight import InstructionSignal
+
+    checks = [
+        Check("git-repository", "pass", "ok"),
+        Check("readme", "pass", "ok"),
+        Check("gitignore", "pass", "ok"),
+        Check("project-manifest", "pass", "ok"),
+    ]
+
+    path_rule = InstructionSignal(
+        "GitHub Copilot",
+        ".github/instructions/python.instructions.md",
+        ".",
+        "path-specific",
+    )
+
+    assert readiness_state(checks, [path_rule]) == "NEEDS ATTENTION"
+
+
+def test_conditional_cursor_rule_is_not_repository_wide_baseline() -> None:
+    from codex_workspace_bootstrap.preflight import InstructionSignal
+
+    checks = [
+        Check("git-repository", "pass", "ok"),
+        Check("readme", "pass", "ok"),
+        Check("gitignore", "pass", "ok"),
+        Check("project-manifest", "pass", "ok"),
+    ]
+
+    conditional = InstructionSignal(
+        "Cursor",
+        ".cursor/rules/manual.mdc",
+        ".",
+        "conditional",
+    )
+
+    assert readiness_state(checks, [conditional]) == "NEEDS ATTENTION"

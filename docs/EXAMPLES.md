@@ -16,6 +16,7 @@ State: NEEDS ATTENTION
 Project: Python
 AI instructions: none detected
 Audit: 10 passed, 4 warnings, 0 blocking
+Instruction integrity: 0 findings, 0 drift, 0 invalid commands, 0 metadata
 Next actions:
   [P1] Add repository instructions for AI coding agents -> cwb init-agents .
 ```
@@ -68,7 +69,7 @@ Tracked secret-risk filenames can become blocking. File contents are not printed
 
 ```powershell
 cwb preflight . --json preflight.json
-cwb audit . --sarif audit.sarif
+cwb preflight . --sarif preflight.sarif
 ```
 
 ## Doctor
@@ -78,3 +79,71 @@ cwb doctor .
 ```
 
 Doctor prints remediation guidance without installing software or changing system configuration.
+
+
+## Cross-agent instruction lint
+
+```powershell
+cwb preflight . --fail-on-integrity
+```
+
+The command exits non-zero when any instruction-integrity finding is detected, including drift, invalid referenced package scripts, conflicting package-manager evidence, or missing scope metadata.
+
+## Safe fix preview
+
+```powershell
+cwb fix .
+```
+
+Review the plan first. Apply only supported low-risk changes with:
+
+```powershell
+cwb fix . --apply
+```
+
+Conflicting existing instruction files are never auto-rewritten.
+
+
+## Nested and path-specific instructions
+
+`cwb` detects nested Codex instructions such as:
+
+```text
+AGENTS.md
+services/payments/AGENTS.override.md
+```
+
+It also reads common frontmatter scopes such as:
+
+```yaml
+---
+applyTo: "services/api/**/*.py"
+---
+```
+
+and:
+
+```yaml
+---
+globs: extensions/intellij/**/*Test.kt
+---
+```
+
+The inferred scope is shown in CLI and Markdown output. Different scopes are not compared as if they were repository-wide rules.
+
+
+### Conservative path-specific comparison
+
+Path-specific rules are still checked against nearby repository evidence such as `packageManager`, lockfiles, and `package.json` scripts. They are not cross-compared with repository-wide or other path-specific rules when only a coarse static prefix is known. This avoids false drift findings between selectors such as `**/*.py` and `**/*.ts`.
+
+
+## Nested Cursor rules
+
+Cursor project rules can be discovered below subdirectories:
+
+```text
+backend/server/.cursor/rules/always.mdc
+frontend/.cursor/rules/react.mdc
+```
+
+A rule with `alwaysApply: true` is treated as a baseline for its containing directory scope. A rule with globs is path-specific. A rule that is neither always-on nor glob-scoped is reported as conditional and does not count as a repository-wide readiness baseline.

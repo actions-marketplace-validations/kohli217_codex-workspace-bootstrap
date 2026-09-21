@@ -98,7 +98,7 @@ def test_version_flag_reports_package_version(capsys: pytest.CaptureFixture[str]
         main(["--version"])
 
     assert exc_info.value.code == 0
-    assert "codex-workspace-bootstrap 0.4.0" in capsys.readouterr().out
+    assert "codex-workspace-bootstrap 0.5.0" in capsys.readouterr().out
 
 
 def test_audit_writes_sarif(tmp_path: Path) -> None:
@@ -158,3 +158,35 @@ def test_preflight_writes_markdown(tmp_path: Path) -> None:
 def test_preflight_strict_fails_only_on_blocking(tmp_path: Path) -> None:
     code = main(["preflight", str(tmp_path), "--strict"])
     assert code == 0
+
+
+def test_preflight_fail_on_integrity_returns_nonzero_for_integrity_finding(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text(
+        '{"packageManager":"pnpm@10","scripts":{"test":"vitest"}}',
+        encoding="utf-8",
+    )
+    (tmp_path / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+    (tmp_path / "AGENTS.md").write_text("Run §npm test§.\n".replace("§", "`"), encoding="utf-8")
+
+    code = main(["preflight", str(tmp_path), "--fail-on-integrity"])
+
+    assert code == 1
+
+
+def test_preflight_writes_comprehensive_sarif(tmp_path: Path) -> None:
+    import json
+
+    (tmp_path / "package.json").write_text(
+        '{"packageManager":"pnpm@10","scripts":{"test":"vitest"}}',
+        encoding="utf-8",
+    )
+    (tmp_path / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+    (tmp_path / "AGENTS.md").write_text("Run §npm test§.\n".replace("§", "`"), encoding="utf-8")
+    report = tmp_path / "preflight.sarif"
+
+    code = main(["preflight", str(tmp_path), "--sarif", str(report)])
+
+    assert code == 0
+    payload = json.loads(report.read_text(encoding="utf-8"))
+    rule_ids = {item["ruleId"] for item in payload["runs"][0]["results"]}
+    assert "instruction-package-manager-mismatch" in rule_ids
