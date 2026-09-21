@@ -148,15 +148,108 @@ def _frontmatter_value(text: str, keys: tuple[str, ...]) -> str | None:
     return None
 
 
+def _split_top_level_commas(value: str) -> list[str]:
+    items: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    escaped = False
+    braces = 0
+    brackets = 0
+    parens = 0
+
+    for char in value:
+        if escaped:
+            current.append(char)
+            escaped = False
+            continue
+
+        if char == "\\":
+            current.append(char)
+            escaped = True
+            continue
+
+        if quote:
+            current.append(char)
+            if char == quote:
+                quote = None
+            continue
+
+        if char in {"'", '"'}:
+            quote = char
+            current.append(char)
+            continue
+
+        if char == "{":
+            braces += 1
+        elif char == "}":
+            braces = max(0, braces - 1)
+        elif char == "[":
+            brackets += 1
+        elif char == "]":
+            brackets = max(0, brackets - 1)
+        elif char == "(":
+            parens += 1
+        elif char == ")":
+            parens = max(0, parens - 1)
+
+        if char == "," and braces == 0 and brackets == 0 and parens == 0:
+            item = "".join(current).strip()
+            if item:
+                items.append(item)
+            current = []
+            continue
+
+        current.append(char)
+
+    item = "".join(current).strip()
+    if item:
+        items.append(item)
+    return items
+
+
+def _strip_matching_quotes(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1].strip()
+    return value
+
+
 def _split_patterns(value: str) -> list[str]:
-    value = value.strip().strip('"').strip("'")
+    value = value.strip()
+
+    # Inline YAML arrays are common, but a glob character class such as [ab]
+    # is also valid. Only treat brackets as an array when the interior looks
+    # list-like.
     if value.startswith("[") and value.endswith("]"):
-        value = value[1:-1]
-    return [
-        item.strip().strip('"').strip("'")
-        for item in value.split(",")
-        if item.strip().strip('"').strip("'")
-    ]
+        inner = value[1:-1].strip()
+        if "," in inner or inner.startswith(("'", '"')):
+            value = inner
+
+    raw_items = _split_top_level_commas(value)
+    patterns: list[str] = []
+
+    for raw in raw_items:
+        item = _strip_matching_quotes(raw)
+        if not item:
+            continue
+
+        # Copilot commonly wraps alternatives in one quoted brace expression:
+        # "{src/**/test/**,src/**/*.test.ts}". Expand only a brace that wraps
+        # the whole selector; embedded brace expansion stays intact so
+        # apps/web/{src,tests}/** still has static prefix apps/web.
+        if item.startswith("{") and item.endswith("}"):
+            alternatives = [
+                _strip_matching_quotes(part)
+                for part in _split_top_level_commas(item[1:-1])
+            ]
+            alternatives = [part for part in alternatives if part]
+            if len(alternatives) > 1:
+                patterns.extend(alternatives)
+                continue
+
+        patterns.append(item)
+
+    return patterns
 
 
 def _static_prefix(pattern: str) -> str:
