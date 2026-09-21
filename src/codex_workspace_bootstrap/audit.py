@@ -1,0 +1,170 @@
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+from pathlib import Path
+import shutil
+import subprocess
+from typing import Iterable
+
+
+@dataclass(frozen=True)
+class Check:
+    name: str
+    status: str
+    message: str
+    blocking: bool = False
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+COMMON_TOOLS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("git", ("git", "--version")),
+    ("python", ("python", "--version")),
+    ("node", ("node", "--version")),
+    ("npm", ("npm", "--version")),
+    ("powershell", ("powershell", "-NoProfile", "-Command", "$PSVersionTable.PSVersion.ToString()")),
+    ("wsl", ("wsl", "--status")),
+    ("codex", ("codex", "--version")),
+)
+
+MANIFESTS = (
+    "pyproject.toml",
+    "requirements.txt",
+    "package.json",
+    "go.mod",
+    "Cargo.toml",
+    "pom.xml",
+    "build.gradle",
+)
+
+RISK_FILENAMES = {
+    ".env",
+    ".env.local",
+    "credentials.json",
+    "service-account.json",
+    "id_rsa",
+    "id_ed25519",
+}
+
+RISK_SUFFIXES = (".pem", ".p12", ".pfx", ".key")
+
+
+def _tool_check(label: str, command: tuple[str, ...]) -> Check:
+    executable = shutil.which(command[0])
+    if not executable:
+        return Check(label, "warn", f"{command[0]} command not found")
+
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        output = (result.stdout or result.stderr).strip().splitlines()
+        detail = output[0] if output else "available"
+        if result.returncode == 0:
+            return Check(label, "pass", detail)
+        return Check(label, "warn", f"available but returned exit code {result.returncode}")
+    except (OSError, subprocess.SubprocessError) as exc:
+        return Check(label, "warn", f"could not execute: {exc}")
+
+
+def _iter_project_files(root: Path) -> Iterable[Path]:
+    excluded = {".git", ".venv", "venv", "node_modules", "__pycache__"}
+    for path in root.rglob("*"):
+        if any(part in excluded for part in path.parts):
+            continue
+        if path.is_file():
+            yield path
+
+
+def audit_repository(root: Path) -> list[Check]:
+    root = root.resolve()
+    checks: list[Check] = []
+
+    git_dir = root / ".git"
+    checks.append(
+        Check(
+            "git-repository",
+            "pass" if git_dir.exists() else "warn",
+            "Git repository detected" if git_dir.exists() else ".git directory not found",
+        )
+    )
+
+    readme = next((p for p in root.iterdir() if p.is_file() and p.name.lower().startswith("readme")), None)
+    checks.append(
+        Check(
+            "readme",
+            "pass" if readme else "warn",
+            f"README detected: {readme.name}" if readme else "README not found",
+        )
+    )
+
+    license_file = next((p for p in root.iterdir() if p.is_file() and p.name.lower().startswith("license")), None)
+    checks.append(
+        Check(
+            "license",
+            "pass" if license_file else "warn",
+            f"License detected: {license_file.name}" if license_file else "License file not found",
+        )
+    )
+
+    checks.append(
+        Check(
+            "gitignore",
+            "pass" if (root / ".gitignore").exists() else "warn",
+            ".gitignore detected" if (root / ".gitignore").exists() else ".gitignore not found",
+        )
+    )
+
+    checks.append(
+        Check(
+            "agents",
+            "pass" if (root / "AGENTS.md").exists() else "warn",
+            "AGENTS.md detected" if (root / "AGENTS.md").exists() else "AGENTS.md not found; run init-agents",
+        )
+    )
+
+    manifests = [name for name in MANIFESTS if (root / name).exists()]
+    checks.append(
+        Check(
+            "project-manifest",
+            "pass" if manifests else "warn",
+            f"Detected: {', '.join(manifests)}" if manifests else "No common project manifest detected",
+        )
+    )
+
+    for label, command in COMMON_TOOLS:
+        checks.append(_tool_check(label, command))
+
+    risky: list[str] = []
+    for path in _iter_project_files(root):
+        name = path.name.lower()
+        if name in RISK_FILENAMES or name.endswith(RISK_SUFFIXES):
+            risky.append(str(path.relative_to(root)))
+
+    if risky:
+        preview = ", ".join(sorted(risky)[:8])
+        suffix = "" if len(risky) <= 8 else f" (+{len(risky) - 8} more)"
+        checks.append(
+            Check(
+                "secret-risk-files",
+                "warn",
+                f"Potential secret-bearing files detected: {preview}{suffix}. Verify they are safe and ignored.",
+            )
+        )
+    else:
+        checks.append(Check("secret-risk-files", "pass", "No common secret-bearing filenames detected"))
+
+    return checks
+
+
+def summary(checks: list[Check]) -> dict[str, int]:
+    return {
+        "passed": sum(c.status == "pass" for c in checks),
+        "warnings": sum(c.status == "warn" for c in checks),
+        "blocking": sum(c.blocking for c in checks),
+    }
