@@ -146,6 +146,42 @@ function manifestFor(origin, name = "CWB Preflight Dev") {
   };
 }
 
+async function buildManifestState(
+  secret,
+  now = Math.floor(Date.now() / 1000),
+) {
+  const nonce = randomToken();
+  const unsigned = `v1.${now}.${nonce}`;
+  const signature = await hmacHex(secret, utf8(unsigned));
+  return `${unsigned}.${signature}`;
+}
+
+async function verifyManifestState(
+  secret,
+  state,
+  now = Math.floor(Date.now() / 1000),
+) {
+  if (typeof state !== "string" || !state) return false;
+  const parts = state.split(".");
+  if (parts.length !== 4 || parts[0] !== "v1" || !parts[2] || !parts[3]) {
+    return false;
+  }
+
+  const issuedAt = Number(parts[1]);
+  if (!Number.isInteger(issuedAt) || issuedAt <= 0) return false;
+  const age = now - issuedAt;
+  if (
+    age < -SETUP_FUTURE_SKEW_SECONDS ||
+    age > SETUP_TTL_SECONDS
+  ) {
+    return false;
+  }
+
+  const unsigned = parts.slice(0, 3).join(".");
+  const expected = await hmacHex(secret, utf8(unsigned));
+  return timingSafeEqual(expected, parts[3]);
+}
+
 function manifestPage(origin, state) {
   const action = `https://github.com/settings/apps/new?state=${encodeURIComponent(state)}`;
   const manifest = JSON.stringify(
@@ -516,10 +552,8 @@ async function dispatchWorkflow(env, queued) {
 async function handleSetup(request, env) {
   if (!setupAuthorized(request, env)) return htmlResponse(200, bootstrapPage());
   const origin = new URL(request.url).origin;
-  const state = randomToken();
-  return htmlResponse(200, manifestPage(origin, state), {
-    "Set-Cookie": `cwb_manifest_state=${state}; Path=/setup/github; Max-Age=3600; Secure; HttpOnly; SameSite=Lax`,
-  });
+  const state = await buildManifestState(env.CWB_SETUP_TOKEN);
+  return htmlResponse(200, manifestPage(origin, state));
 }
 
 async function handleSetupSession(request, env) {
@@ -536,14 +570,24 @@ async function handleSetupSession(request, env) {
 }
 
 async function handleSetupCallback(request, env) {
-  if (!setupAuthorized(request, env)) return jsonResponse(403, { error: "forbidden" });
   const url = new URL(request.url);
   const code = url.searchParams.get("code");
   const state = url.searchParams.get("state");
-  const expectedState = parseCookies(request).get("cwb_manifest_state");
-  if (!code || !state || !expectedState || !timingSafeEqual(state, expectedState)) {
+  if (!code || !state) {
     return jsonResponse(400, { error: "invalid manifest callback" });
   }
+
+  const signedStateValid = await verifyManifestState(
+    env.CWB_SETUP_TOKEN,
+    state,
+  );
+  const legacyRecoveryAuthorized =
+    !signedStateValid && setupAuthorized(request, env);
+
+  if (!signedStateValid && !legacyRecoveryAuthorized) {
+    return jsonResponse(403, { error: "forbidden" });
+  }
+
   const credentials = await exchangeManifestCode(code);
   await storeCredentials(env, credentials);
   const slug = String(credentials.slug || "");
@@ -663,12 +707,14 @@ export {
   base64urlEncode,
   base64urlDecode,
   brokerGrant,
+  buildManifestState,
   manifestFor,
   normalizeWebhook,
   pkcs1ToPkcs8,
   setupTokenIsValid,
   timingSafeEqual,
   validateQueuedTokenEndpoint,
+  verifyManifestState,
 };
 
 export default {
