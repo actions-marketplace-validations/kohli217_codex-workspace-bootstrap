@@ -1,7 +1,7 @@
 from pathlib import Path
 import json
 
-from codex_workspace_bootstrap.instructions import detect_instruction_signals, lint_instructions
+from codex_workspace_bootstrap.instructions import detect_instruction_signals, extract_commands, lint_instructions
 
 
 def test_public_pattern_openai_codex_pnpm_repo_without_js_command_drift(tmp_path: Path) -> None:
@@ -186,5 +186,34 @@ def test_public_pattern_tracecat_directory_target_uses_frontend_package(tmp_path
 
     findings = lint_instructions(tmp_path)
 
+    assert not any(item.kind == "missing-package-script" for item in findings)
+
+
+def test_public_pattern_warp_yarn_inline_cwd_uses_website_package(tmp_path: Path) -> None:
+    """Pattern observed in broadinstitute/warp at 8005650: inline Yarn cwd targets website."""
+    website = tmp_path / "website"
+    website.mkdir()
+    (website / "package.json").write_text(
+        json.dumps(
+            {
+                "scripts": {
+                    "start": "docusaurus start",
+                    "build": "docusaurus build",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    instruction_text = (
+        "Preview with `yarn --cwd=website start` and validate with "
+        "`yarn --cwd=website build`.\n"
+    )
+    (tmp_path / "AGENTS.md").write_text(instruction_text, encoding="utf-8")
+
+    commands = extract_commands(instruction_text)
+    findings = lint_instructions(tmp_path)
+
+    assert "yarn --cwd=website start" in commands
+    assert "yarn --cwd=website build" in commands
     assert not any(item.kind == "missing-package-script" for item in findings)
 
