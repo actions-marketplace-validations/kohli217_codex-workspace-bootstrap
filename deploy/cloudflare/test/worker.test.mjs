@@ -8,10 +8,10 @@ import {
   base64urlDecode,
   base64urlEncode,
   brokerGrant,
-  ensureRepositoryVariable,
   manifestFor,
   normalizeWebhook,
   setupTokenIsValid,
+  validateQueuedTokenEndpoint,
 } from "../src/index.mjs";
 
 test("setup token expires after one hour", () => {
@@ -116,54 +116,20 @@ test("broker grant is deterministic and delivery-bound", async () => {
 });
 
 
-test("repository variable helper updates existing variable", async () => {
-  const originalFetch = globalThis.fetch;
-  const calls = [];
-  globalThis.fetch = async (url, options) => {
-    calls.push({ url, options });
-    return new Response(null, { status: 204 });
-  };
-
-  try {
-    await ensureRepositoryVariable(
-      { CWB_DISPATCH_TOKEN: "github-token" },
-      "https://cwb.example.workers.dev",
-    );
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
-
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0].options.method, "PATCH");
-  assert.match(calls[0].url, /actions\/variables\/CWB_TOKEN_ENDPOINT$/);
-  assert.deepEqual(JSON.parse(calls[0].options.body), {
-    name: "CWB_TOKEN_ENDPOINT",
-    value: "https://cwb.example.workers.dev/tokens/github",
-  });
+test("queued token endpoint is restricted to workers.dev broker path", () => {
   assert.equal(
-    calls[0].options.headers.Authorization,
-    "Bearer github-token",
+    validateQueuedTokenEndpoint(
+      "https://cwb-github-free.kohli217.workers.dev/tokens/github",
+    ),
+    "https://cwb-github-free.kohli217.workers.dev/tokens/github",
   );
-});
 
-test("repository variable helper creates variable after 404", async () => {
-  const originalFetch = globalThis.fetch;
-  const methods = [];
-  globalThis.fetch = async (_url, options) => {
-    methods.push(options.method);
-    return methods.length === 1
-      ? new Response(null, { status: 404 })
-      : new Response(null, { status: 201 });
-  };
-
-  try {
-    await ensureRepositoryVariable(
-      { CWB_DISPATCH_TOKEN: "github-token" },
-      "https://cwb.example.workers.dev",
-    );
-  } finally {
-    globalThis.fetch = originalFetch;
+  for (const value of [
+    "http://cwb-github-free.kohli217.workers.dev/tokens/github",
+    "https://example.com/tokens/github",
+    "https://cwb-github-free.kohli217.workers.dev/other",
+    "https://cwb-github-free.kohli217.workers.dev/tokens/github?next=evil",
+  ]) {
+    assert.throws(() => validateQueuedTokenEndpoint(value));
   }
-
-  assert.deepEqual(methods, ["PATCH", "POST"]);
 });

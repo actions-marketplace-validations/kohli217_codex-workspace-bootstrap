@@ -458,7 +458,27 @@ async function verifyActionsOidc(token, audience) {
   return payload;
 }
 
+function validateQueuedTokenEndpoint(value) {
+  if (typeof value !== "string" || !value) {
+    throw new Error("queued token endpoint is missing");
+  }
+  const url = new URL(value);
+  if (
+    url.protocol !== "https:" ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash ||
+    url.pathname !== "/tokens/github" ||
+    !url.hostname.endsWith(".workers.dev")
+  ) {
+    throw new Error("queued token endpoint is invalid");
+  }
+  return url.toString().replace(/\/$/, "");
+}
+
 async function dispatchWorkflow(env, queued) {
+  const tokenEndpoint = validateQueuedTokenEndpoint(queued.token_endpoint);
   const credentials = await loadCredentials(env);
   const grant = await brokerGrant(
     credentials.webhook_secret,
@@ -485,61 +505,12 @@ async function dispatchWorkflow(env, queued) {
         ref: GITHUB_REF,
         inputs: {
           payload,
+          token_endpoint: tokenEndpoint,
         },
       }),
     },
   );
   if (!response.ok) throw new Error(`workflow dispatch failed with HTTP ${response.status}`);
-}
-
-async function ensureRepositoryVariable(env, origin) {
-  const base =
-    `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/actions/variables`;
-  const headers = {
-    Accept: GITHUB_ACCEPT,
-    Authorization: `Bearer ${env.CWB_DISPATCH_TOKEN}`,
-    "Content-Type": "application/json",
-    "User-Agent": GITHUB_USER_AGENT,
-    "X-GitHub-Api-Version": GITHUB_API_VERSION,
-  };
-  const body = JSON.stringify({
-    name: "CWB_TOKEN_ENDPOINT",
-    value: `${origin}/tokens/github`,
-  });
-
-  let response = await fetch(`${base}/CWB_TOKEN_ENDPOINT`, {
-    method: "PATCH",
-    headers,
-    body,
-  });
-  if (response.status === 404) {
-    response = await fetch(base, {
-      method: "POST",
-      headers,
-      body,
-    });
-  }
-  if (!response.ok) {
-    throw new Error(
-      `repository variable update failed with HTTP ${response.status}`,
-    );
-  }
-}
-
-async function handleRepositoryVariableSetup(request, env) {
-  let body;
-  try {
-    body = await request.json();
-  } catch {
-    return jsonResponse(400, { error: "invalid JSON" });
-  }
-  const token = body?.token;
-  if (!setupTokenIsValid(env.CWB_SETUP_TOKEN, token)) {
-    return jsonResponse(403, { error: "forbidden" });
-  }
-
-  await ensureRepositoryVariable(env, new URL(request.url).origin);
-  return jsonResponse(200, { configured: true });
 }
 
 async function handleSetup(request, env) {
@@ -615,9 +586,11 @@ async function handleWebhook(request, env) {
     return jsonResponse(400, { error: "invalid webhook payload" });
   }
   if (decision.disposition === "scan") {
+    const origin = new URL(request.url).origin;
     await env.SCAN_QUEUE.send({
       delivery_id: deliveryId,
       target: decision.target,
+      token_endpoint: `${origin}/tokens/github`,
     });
   }
   return jsonResponse(202, {
@@ -690,12 +663,12 @@ export {
   base64urlEncode,
   base64urlDecode,
   brokerGrant,
-  ensureRepositoryVariable,
   manifestFor,
   normalizeWebhook,
   pkcs1ToPkcs8,
   setupTokenIsValid,
   timingSafeEqual,
+  validateQueuedTokenEndpoint,
 };
 
 export default {
@@ -710,12 +683,6 @@ export default {
       }
       if (request.method === "POST" && url.pathname === "/setup/github/session") {
         return handleSetupSession(request, env);
-      }
-      if (
-        request.method === "POST" &&
-        url.pathname === "/setup/repository-variable"
-      ) {
-        return handleRepositoryVariableSetup(request, env);
       }
       if (request.method === "GET" && url.pathname === "/setup/github/callback") {
         return handleSetupCallback(request, env);
