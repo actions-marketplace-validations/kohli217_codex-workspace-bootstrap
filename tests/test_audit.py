@@ -4,7 +4,12 @@ import subprocess
 
 import pytest
 
-from codex_workspace_bootstrap.audit import _git_tracked_files, audit_repository, summary
+from codex_workspace_bootstrap.audit import (
+    Check,
+    _git_tracked_files,
+    audit_repository,
+    summary,
+)
 
 
 def _git(root: Path, *args: str) -> None:
@@ -54,6 +59,7 @@ def test_tracked_secret_risk_file_is_blocking(tmp_path: Path) -> None:
 
     assert by_name["secret-risk-files"].status == "warn"
     assert by_name["secret-risk-files"].blocking is True
+    assert by_name["secret-risk-files"].paths == (".env",)
     assert "tracked:" in by_name["secret-risk-files"].message
 
 
@@ -68,6 +74,7 @@ def test_ignored_secret_risk_file_is_not_blocking(tmp_path: Path) -> None:
 
     assert by_name["secret-risk-files"].status == "warn"
     assert by_name["secret-risk-files"].blocking is False
+    assert by_name["secret-risk-files"].paths == ()
     assert "ignored:" in by_name["secret-risk-files"].message
 
 
@@ -222,6 +229,7 @@ def test_tracked_risky_file_inside_pruned_directory_is_blocking(tmp_path: Path) 
     risk = by_name["secret-risk-files"]
     assert risk.status == "warn"
     assert risk.blocking is True
+    assert risk.paths == ("node_modules/pkg/.env",)
     assert "node_modules/pkg/.env" in risk.message
     assert "tracked:" in risk.message
 
@@ -239,6 +247,7 @@ def test_tracked_risky_file_inside_dist_is_blocking(tmp_path: Path) -> None:
 
     risk = by_name["secret-risk-files"]
     assert risk.blocking is True
+    assert risk.paths == ("dist/release.key",)
     assert "dist/release.key" in risk.message
 
 
@@ -346,3 +355,17 @@ def test_repository_only_audit_skips_local_toolchain_checks(
     assert names.isdisjoint({"npm", "pnpm", "yarn", "bun"})
     assert "project-manifest" in names
     assert "secret-risk-files" in names
+
+
+def test_check_to_dict_only_emits_paths_when_present() -> None:
+    without_paths = Check("readme", "warn", "README not found")
+    with_paths = Check(
+        "secret-risk-files",
+        "warn",
+        "Tracked risky filename.",
+        blocking=True,
+        paths=(".env.production",),
+    )
+
+    assert "paths" not in without_paths.to_dict()
+    assert with_paths.to_dict()["paths"] == [".env.production"]
