@@ -2,6 +2,91 @@
 
 All notable changes to this project will be documented here.
 
+## [0.11.0] - 2026-09-23
+
+### Added
+- Public GitHub Marketplace preparation for the free CWB Preflight App, including secure Marketplace setup/OAuth verification and fail-closed plan lifecycle handling without widening repository permissions.
+- File-level GitHub Check annotations for instruction-integrity findings and tracked secret-risk filenames, plus SARIF locations for structured audit paths.
+- Optional root `.cwb.json` repository suppressions for narrowly scoped known false positives. Suppressions require reasons, remain visible in reports, and cannot hide blocking, essential-readiness, tracked secret-risk, or error-severity findings.
+- Python validation-command recognition for Ruff, mypy, Pyright, tox, nox, and pre-commit, including safe normalization across direct, `python -m`, `uv run`, `poetry run`, and `pdm run` forms where applicable.
+
+### Changed
+- GitHub Check Runs now make applied repository suppressions and invalid suppression configuration visible directly on `.cwb.json`.
+- Validation-command drift can now distinguish Python lint/typecheck/test/check families while preserving path-specific scope isolation.
+- The public App remains public-repository-only on the zero-cost Cloudflare/GitHub Actions deployment and keeps the same least-privilege GitHub permissions.
+
+### Safety
+- Repository suppressions fail closed: only a regular non-symlink root `.cwb.json` up to 64 KB is accepted, exact relative paths are required for instruction suppressions, and unsafe broad suppressions are rejected.
+- GitHub annotations continue to avoid reading or printing secret-file contents.
+- Python validation recognition is lexical only; commands extracted from instructions are never executed.
+
+### Documentation and regression coverage
+- Added a CI-verified multi-agent Python demo showing real typecheck drift, wrapper equivalence, and isolation of path-specific Copilot rules.
+- Added a fixed public regression fixture modeled from `plexe-ai/plexe` for Poetry-wrapped Pytest/Ruff guidance with a strict `CLAUDE.md -> AGENTS.md` compatibility alias.
+- Expanded English/Japanese docs, GitHub App guidance, integration contracts, security notes, and roadmap coverage for the new behavior.
+
+## [0.10.0] - 2026-09-22
+
+### Fixed
+- pnpm exact repository-relative path filters such as `pnpm --filter ./api test` now validate against the targeted package instead of dropping script validation.
+- Package commands following a safe repository-relative `cd <dir> && ...` chain retain their lexical working-directory context for script validation without changing the public command-extraction API.
+- npm `--prefix` and pnpm `--filter` routing are recognized when those options appear after the script name as well as before it, while script arguments after `--` remain untouched.
+- Unfiltered pnpm `-r` / `--recursive` and npm `--workspaces` / `-ws` fan-out commands no longer produce root-package missing-script false positives.
+- npm exact `--workspace` / `-w` selectors can resolve safe repository-relative workspace directories when the selector differs from the package name.
+
+### Safety
+- Exact path routing continues to reject absolute paths, parent traversal, glob/ambiguous selectors, unsafe cwd forms, and missing targets rather than guessing.
+- Recursive/workspace fan-out handling deliberately avoids emulating complete package-manager selection semantics; commands extracted from instructions remain non-executable lint evidence only.
+
+### Documentation
+- Added fixed public regression fixtures for `unraid/api`, `bytedance/deer-flow`, `withcoral/coral`, `marktoflow/marktoflow`, `forwardsoftware/react-auth`, `KutyAI/Private-Hosting-App`, and `kryten87/PromptKitchen`.
+
+## [0.9.0] - 2026-09-22
+
+### Added
+- Real-world regression fixtures for targeted-workspace, targeted-directory, inline-option, and shared multi-agent instruction layouts observed in d3plus/d3plus, TracecatHQ/tracecat, broadinstitute/warp, WordPress/pattern-directory, vtex/address-form, and kickflip-labs/cissp-study-hub.
+- Safe canonical-instruction aliases for Claude Code and Gemini CLI when an exact sibling `CLAUDE.md -> AGENTS.md` or `GEMINI.md -> AGENTS.md` link targets a regular `AGENTS.md`; Gemini aliases continue to honor project `context.fileName` settings.
+
+### Fixed
+- Monorepo package-script validation now resolves exact pnpm filters, npm workspace selectors, and Yarn workspace targets instead of incorrectly validating workspace-only scripts against the root package.
+- Directory-targeted commands now validate scripts against the explicitly selected package for pnpm `-C` / `--dir`, npm `--prefix`, and Yarn/Bun `--cwd`, while unsafe or ambiguous directory targets do not fall back to unrelated root scripts.
+- Yarn command extraction preserves inline options such as `yarn --cwd=website build`.
+- npm workspace selectors placed after `run <script>` are resolved in `--workspace` / `-w` forms up to npm's `--` script-argument separator.
+
+### Security
+- Safe Claude/Gemini aliases are recognized from lexical link metadata only; CWB revalidates the alias and reads the regular sibling `AGENTS.md` directly rather than trusting instruction content through a symbolic link.
+- Absolute/other alias targets, parent traversal, missing targets, and chained/symlinked `AGENTS.md` targets remain rejected, and write operations continue to refuse symlinked `AGENTS.md` targets.
+
+### Documentation
+- Expanded the reproducible public-repository evaluation set to document the exact monorepo and shared-instruction patterns protected by v0.9.0.
+
+## [0.8.0] - 2026-09-22
+
+### Added
+- A complete GitHub App integration contract: Check rendering, constant-time signed-webhook verification, push/pull-request normalization, repository-only preflight, and a network-free service core.
+- Deterministic GitHub App JWT, installation-token, and Check Run delivery contracts plus hardened exact-revision checkout for pushes, pull requests, and fork pull requests without executing repository code.
+- A least-privilege GitHub App worker runtime with repository-scoped installation tokens and completed-delivery idempotency using GitHub delivery IDs and Check Run `external_id`.
+- GitHub App Manifest registration plus a Cloud Run + Pub/Sub reference deployment with separated ingress/worker identities and durable redelivery.
+- A completely free Cloudflare Worker + Queue + public GitHub Actions deployment using GitHub Actions OIDC for installation-token brokering, with private-repository events rejected before queueing.
+- A reproducible scoped-monorepo demo and an additional fixed public-repository Gemini CLI `context.fileName` regression fixture.
+
+### Fixed
+- GitHub REST requests now include the required User-Agent.
+- The Windows Cloudflare deploy isolates a verified Node.js 22/Wrangler toolchain from machine-wide Node, handles harmless PowerShell native stderr correctly, reuses interrupted KV/Queue/secret state, and guides current workers.dev onboarding.
+- The free deployment reuses the persisted GitHub dispatch credential and no longer depends on repository Actions Variables permissions.
+- GitHub App Manifest callbacks use signed stateless state, recover safely from async callback failures, and reuse already-stored credentials instead of duplicating Apps.
+- The live GitHub App Actions worker exposes the src-layout package correctly and authenticates exact Git fetches with GitHub's installation-token HTTP Basic contract.
+
+### Security
+- GitHub App setup bootstrap tokens expire after one hour; Manifest callback state is HMAC-signed and time-limited.
+- App permissions remain least-privilege: Checks read/write, Contents read-only, and Pull requests read-only; runtime installation tokens are narrowed further to the single event repository with only `contents:read` and `checks:write`.
+- The free public-OSS path rejects private-repository webhook events before they reach the public Actions worker.
+- Checkout disables interactive credentials, system/global Git config, hooks, submodules, and repository command execution.
+
+### Documentation
+- The GitHub App is documented as a shipped integration, including the zero-cost public-repository deployment, live installed-App E2E milestone, and a promotion runbook for reusing the verified development App as a public App.
+- Added a real-world scoped monorepo example covering nearest package-manager evidence.
+
 ## [0.7.0] - 2026-09-22
 
 ### Added

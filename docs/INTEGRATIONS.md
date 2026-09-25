@@ -1,0 +1,344 @@
+# Integration contract
+
+`codex-workspace-bootstrap` keeps repository analysis separate from delivery surfaces such as the CLI, GitHub Action, GitHub App, and future AI-agent skills.
+
+The supported integration boundary is the preflight report plus the shared policy evaluator.
+
+## Build a report
+
+```python
+from pathlib import Path
+
+from codex_workspace_bootstrap.preflight import (
+    PREFLIGHT_REPORT_SCHEMA_VERSION,
+    build_preflight,
+)
+
+report = build_preflight(Path("."))
+assert report["schema_version"] == PREFLIGHT_REPORT_SCHEMA_VERSION
+assert report["local_toolchain_checked"] is True
+```
+
+The report is deterministic for the repository/toolchain evidence inspected by the core preflight. The core preflight does not send repository contents to a remote AI service.
+
+## Report schema version
+
+Every preflight report contains:
+
+```json
+{
+  "schema_version": 1
+}
+```
+
+Consumers should check `schema_version` before depending on report fields.
+
+Within a schema version, new optional fields may be added. A change that intentionally breaks the machine-readable contract must increment `PREFLIGHT_REPORT_SCHEMA_VERSION`.
+
+This makes it possible for integrations to reject an unsupported report version instead of silently misinterpreting it.
+
+The current contract can be inspected without adding a runtime schema dependency:
+
+```powershell
+cwb schema preflight
+cwb schema config
+```
+
+Python integrations can call `codex_workspace_bootstrap.schemas.schema_document(...)`. See [SCHEMAS.md](SCHEMAS.md) for the schema contract and [STABILITY.md](STABILITY.md) for the v1.x semantic-versioning, deprecation, and upgrade policy. JSON Schema documents interoperability structure; fail-closed parser checks remain authoritative for security boundaries.
+
+## Repository suppression configuration
+
+`build_preflight(...)` automatically reads an optional root `.cwb.json`. This behavior is part of the shared preflight boundary, so the CLI, reusable GitHub Action, GitHub App, and future adapters see the same active findings.
+
+Configuration is intentionally narrow and fail-closed:
+
+- the format is versioned JSON and uses only the Python standard library;
+- only a regular, non-symlinked root `.cwb.json` up to 64 KB is accepted;
+- every suppression requires a non-empty reason;
+- instruction suppressions require an exact repository-relative file path and scope;
+- blocking checks, essential readiness checks, tracked secret-risk findings, and error-severity instruction findings cannot be suppressed;
+- invalid or unsafe configuration is represented as a `configuration` warning and makes the preflight state `NEEDS ATTENTION`;
+- applied and unused suppressions remain visible through optional `configuration` and `suppressions` report fields.
+
+These are additive optional fields under schema version 1. Consumers that do not use them can continue to rely on the existing contract.
+
+The lower-level `audit_repository(...)` API and `cwb audit` command intentionally return raw, unsuppressed evidence.
+
+## Evaluate policy once
+
+Delivery surfaces should not reimplement READY / NEEDS ATTENTION / BLOCKED gating.
+
+Use the shared evaluator:
+
+```python
+from codex_workspace_bootstrap.preflight import evaluate_preflight_policy
+
+decision = evaluate_preflight_policy(
+    report,
+    strict=True,
+    fail_on_integrity=True,
+    require_ready=False,
+)
+
+if decision.passed:
+    print("pass")
+else:
+    print(decision.failures)
+```
+
+The current failure identifiers are:
+
+- `blocking-findings` — `strict=True` and the preflight state is `BLOCKED`
+- `instruction-integrity-findings` — `fail_on_integrity=True` and integrity findings exist
+- `repository-not-ready` — `require_ready=True` and the state is not `READY`
+
+The CLI uses this same evaluator. The reusable GitHub Action invokes the CLI, so it inherits the same policy behavior.
+
+## Render a human-readable check summary
+
+```python
+from codex_workspace_bootstrap.preflight import render_markdown
+
+summary = render_markdown(report)
+```
+
+A GitHub App can use the generated Markdown as the basis for a Check Run summary instead of inventing a second report format.
+
+## Remote / GitHub App preflight
+
+A remote scanner must not treat the scanner host's installed tools as repository evidence. Build the report in repository-only mode:
+
+```python
+report = build_preflight(
+    Path("."),
+    include_local_toolchain=False,
+)
+assert report["local_toolchain_checked"] is False
+```
+
+Repository-only mode still checks repository structure, project/package-manager evidence, AI instructions, Git tracking state, risky filenames, and instruction integrity. It skips availability/version probes for local tools such as Node.js, package managers, PowerShell, WSL, and Codex.
+
+The CLI equivalent is `cwb preflight . --repository-only`.
+
+## GitHub Check adapter
+
+The package includes a network-free adapter that converts a supported preflight report into GitHub Check Run fields:
+
+```python
+from codex_workspace_bootstrap.integrations.github import build_github_check
+
+check = build_github_check(
+    report,
+    strict=True,
+    fail_on_integrity=True,
+    require_ready=False,
+)
+
+fields = check.to_check_run_fields()
+# A GitHub App adds its commit head_sha when creating the Check Run.
+```
+
+The adapter rejects unsupported `schema_version` values instead of silently interpreting them. Policy failures map to a `failure` conclusion, READY maps to `success`, and policy-allowed non-READY states map to `neutral`.
+
+It performs no network requests and does not require GitHub credentials.
+
+## GitHub webhook core
+
+The package also includes a network-free webhook core for the App delivery layer:
+
+```python
+from codex_workspace_bootstrap.integrations.github_webhook import (
+    normalize_github_webhook,
+    should_run_github_preflight,
+    verify_github_webhook_signature,
+)
+
+if not verify_github_webhook_signature(secret, raw_body, signature_header):
+    raise PermissionError("invalid webhook signature")
+
+target = normalize_github_webhook(event_name, payload)
+if should_run_github_preflight(target):
+    print(target.repository, target.head_sha)
+```
+
+The webhook core:
+
+- verifies `X-Hub-Signature-256` with HMAC-SHA256 and constant-time comparison;
+- normalizes supported `pull_request` and `push` payloads to repository + commit SHA;
+- ignores pull-request actions that do not require a new scan;
+- rejects deleted-ref pushes because they have no commit to inspect;
+- performs no network requests and does not require GitHub credentials.
+
+## GitHub App service core
+
+Webhook delivery can use the network-free service core:
+
+```python
+from codex_workspace_bootstrap.integrations.github_app_service import (
+    build_github_app_check,
+    prepare_github_app_event,
+)
+
+decision = prepare_github_app_event(
+    event_name=event_name,
+    raw_body=raw_body,
+    signature_header=signature_header,
+    webhook_secret=webhook_secret,
+)
+
+if decision.disposition == "scan":
+    check = build_github_app_check(repository_root)
+```
+
+It handles signature verification, JSON parsing, ping/ignored/scan routing, and forces repository-only preflight semantics. Installation-token exchange, authenticated checkout, and Check Run publication remain outside this pure core.
+
+## Secure GitHub checkout
+
+A GitHub App can build a deterministic checkout plan from the normalized webhook target and fetch the exact revision without executing repository commands:
+
+```python
+from codex_workspace_bootstrap.integrations.github_checkout import (
+    build_github_checkout_plan,
+    checkout_github_repository,
+)
+
+plan = build_github_checkout_plan(target)
+checkout = checkout_github_repository(
+    plan,
+    installation_token=installation_token,
+    destination=temporary_repository_path,
+)
+```
+
+Pull requests prefer GitHub's exact test merge SHA when present and safely fall back to the exact PR head. Pushes remain pinned to the webhook commit. Dynamic refs are accepted only when they resolve to the expected event SHA.
+
+## GitHub delivery contract
+
+GitHub authentication/request construction is represented without coupling the core to a particular HTTP or cryptography library:
+
+```python
+from codex_workspace_bootstrap.integrations.github_delivery import (
+    build_check_run_request,
+    build_github_app_jwt,
+    build_installation_token_request,
+)
+```
+
+The JWT builder accepts an injected RS256 signer. The REST request builders produce the exact method, URL, versioned GitHub headers, and JSON body for installation-token exchange and completed Check Run creation. Actual private-key loading and HTTP transport remain in the outer delivery shell.
+
+## GitHub App worker runtime
+
+The outer worker can now execute the delivery contracts without third-party Python runtime dependencies:
+
+```python
+from codex_workspace_bootstrap.integrations.github_runtime import (
+    execute_github_scan,
+)
+
+result = execute_github_scan(
+    target,
+    client_id=client_id,
+    private_key_path=private_key_path,
+)
+```
+
+The runtime uses OpenSSL for RS256 signing and the Python standard library for HTTPS. The installation token is reduced to the single event repository with only `contents:read` and `checks:write`. This runtime is intended for queued/background processing after the webhook has already been acknowledged.
+
+When a queue supplies a GitHub delivery ID, the runtime writes it to the Check Run `external_id`. Before a retry runs preflight, it lists CWB Check Runs on the exact inspected commit; a completed matching `external_id` is returned as a deduplicated result. Incomplete matches do not suppress a retry.
+
+## GitHub App Manifest contract
+
+The deployment can generate a GitHub App Manifest registration directly from the same registration contract:
+
+```python
+from codex_workspace_bootstrap.integrations.github_manifest import (
+    build_manifest_registration,
+    parse_manifest_conversion_response,
+    verify_manifest_callback_state,
+)
+```
+
+The manifest uses the deployed HTTPS base URL for the webhook and registration callback, preserves the minimum CWB permissions/events, defaults the development App to private, and produces a CSRF state value. Conversion-response credentials are represented by a redacted object whose public metadata excludes the private key and webhook secret.
+
+## Free Cloudflare ingress + GitHub Actions worker
+
+The preferred zero-cost deployment is [deploy/cloudflare](../deploy/cloudflare/README.md):
+
+```text
+GitHub webhook
+  -> Cloudflare Worker signature verification
+  -> Cloudflare Queue durable handoff
+  -> workflow_dispatch in the public CWB repository
+  -> GitHub Actions OIDC
+  -> Cloudflare installation-token broker
+  -> execute_github_scan_with_token(...)
+```
+
+The Actions worker calls the same core runtime with a pre-scoped installation token. This keeps repository scanning in Python while the edge gateway remains a small JavaScript adapter. Cloudflare supplies its own `https://*.workers.dev/tokens/github` URL as the workflow's OIDC audience; the broker verifies that audience against the endpoint receiving the request, plus GitHub's signature and exact workflow identity, before minting a token restricted to one event repository with `contents:read` and `checks:write`.
+
+The App private key and webhook secret remain in Cloudflare KV and are never copied to the GitHub Actions runner. This zero-cost adapter is limited to public repositories: private-repository webhooks are rejected before queueing. Each queued scan also carries an HMAC broker grant bound to the full normalized target so a manually altered workflow input cannot request a token for another commit or repository.
+
+## Cloud Run ingress + durable queue
+
+The reference deployment in [deploy/cloudrun](../deploy/cloudrun/README.md) keeps webhook acknowledgement and repository scanning on separate services:
+
+```text
+GitHub webhook
+  -> public Cloud Run ingress
+  -> Pub/Sub durable queue
+  -> IAM-protected Cloud Run worker
+  -> existing worker runtime
+```
+
+The ingress uses the existing signed-webhook service core and publishes only the normalized target plus GitHub delivery ID. The worker decodes that queue message and invokes the existing least-privilege scan runtime.
+
+## GitHub App registration contract
+
+The minimum repository permissions and webhook subscriptions are also represented in code:
+
+```python
+from codex_workspace_bootstrap.integrations.github_app import (
+    required_github_app_registration,
+)
+
+registration = required_github_app_registration()
+```
+
+The current contract is Checks write, Contents read, Pull requests read, with only `pull_request` and `push` webhook subscriptions. See [GITHUB_APP.md](GITHUB_APP.md) for the registration runbook.
+
+## GitHub App service architecture
+
+The GitHub App remains a thin delivery layer over the shared preflight and policy core:
+
+```text
+GitHub webhook
+    ↓
+verify signature + normalize event
+    ↓
+obtain installation token + checkout/read repository
+    ↓
+build_preflight(..., include_local_toolchain=False)
+    ↓
+build_github_check(...)
+    ↓
+GitHub Check Run API
+```
+
+The App does not duplicate repository detection, instruction linting, readiness-state logic, policy gating, Check result mapping, or webhook routing rules.
+
+## Intended AI-skill adapter
+
+A future agent skill can use the same boundary:
+
+```text
+agent request
+    ↓
+build_preflight(...)
+    ↓
+evaluate_preflight_policy(..., require_ready=True)
+    ↓
+READY → continue
+not READY → report findings before editing
+```
+
+Integrations must not treat READY as a security guarantee. It only means the repository satisfies the checks represented by the current preflight schema.

@@ -2,7 +2,7 @@
 
 **AIコーディングエージェントにリポジトリを触らせる前のpreflightツール**です。
 
-Windows-first、ローカル実行中心、CI対応。Codexだけでなく、Copilot / Cline / Claude Code / Gemini CLI / Continue / Cursor系の指示ファイルを横断し、存在確認だけでなく指示間のdriftも検出します。
+Windows-first、ローカル実行中心、CI対応。Codexだけでなく、Copilot / Cline / Claude Code / Gemini CLI / Continue / Cursor / Windsurf系の指示ファイルを横断し、存在確認だけでなく指示間のdriftも検出します。
 
 > コミュニティ運営のOSSです。OpenAI公式製品ではありません。
 
@@ -28,11 +28,11 @@ preflightは、次に何をすべきかをP0/P1/P2の優先度付きで表示し
 - Git / Python / Node.js / Repoで選択されたpackage manager / PowerShell / WSL / Codex
 - AGENTS.md
 - GitHub Copilot repository instructions
-- Cline / Claude Code / Gemini CLI / Continue / Cursor系の指示ファイル
+- Cline / Claude Code / Gemini CLI / Continue / Cursor / Windsurf系の指示ファイル
 - .env / `.env.production` などの環境別 `.env.*` / private-key系などsecret-riskになりやすいファイル名（`.env.example` などの一般的なテンプレート名は除外）
 - Git追跡済み / ignore済み / untrackedの区別
 
-さらに、packageManager / lockfile / package.json scriptsを根拠に、AI指示間のpackage manager不一致、存在しないscript、test/lint/build系コマンドの食い違いを保守的に検出します。ネストされた `AGENTS.md` / `AGENTS.override.md` / `CLAUDE.md` / `GEMINI.md` と、Copilotの `applyTo` やruleの `globs` から適用scopeも判定し、別scopeの指示を無理に矛盾扱いしません。
+さらに、packageManager / lockfile / package.json scriptsを根拠に、AI指示間のpackage manager不一致、存在しないscript、test/lint/build/typecheck/check系コマンドの食い違いを保守的に検出します。Pythonでは `ruff check` / `mypy` / `pyright` / `tox` / `nox` / `pre-commit run` を認識し、対応可能な `python -m` / `uv run` / `poetry run` / `pdm run` 形式も同一toolとして正規化します。ネストされた `AGENTS.md` / `AGENTS.override.md` / `CLAUDE.md` / `GEMINI.md` と、Copilotの `applyTo` やruleの `globs` から適用scopeも判定し、別scopeの指示を無理に矛盾扱いしません。
 
 Secret候補のファイル内容は表示しません。
 
@@ -64,6 +64,57 @@ SARIF:
 cwb preflight . --sarif preflight.sarif
 ```
 
+## 機械可読schema
+
+外部連携やRepo policy向けのJSON SchemaはCLIから確認できます。
+
+```powershell
+cwb schema preflight
+cwb schema config
+```
+
+preflight reportは現在 `schema_version: 1`、root `.cwb.json` は `version: 1` です。互換性を壊す変更では既存versionの意味を黙って変えず、新しいversionへ上げます。詳細は [SCHEMAS.md](SCHEMAS.md) を参照してください。
+
+v1.xのCLI / schema / config / GitHub Action / GitHub Appに対する互換性方針とupgrade手順は [STABILITY.md](STABILITY.md) にまとめています。1.xでは検出精度の改善は継続しますが、既存の公開interfaceを黙って別物にしません。
+
+## 意図した警告を安全に抑制する
+
+Repo固有の事情で、既知の非blocking警告を意図的に許容したい場合は、Repo rootに `.cwb.json` を置けます。
+
+```json
+{
+  "version": 1,
+  "suppress": {
+    "checks": [
+      {
+        "name": "license",
+        "reason": "この内部Repoでは単独のLICENSEを置かない運用です。"
+      }
+    ],
+    "instruction_findings": [
+      {
+        "kind": "validation-command-drift",
+        "path": "CLAUDE.md",
+        "scope": ".",
+        "reason": "Claudeでは意図的に軽量なsmoke testだけを実行します。"
+      }
+    ]
+  }
+}
+```
+
+抑制はfail-closedです。すべての抑制に理由が必要で、instruction findingは正確なRepo相対パスを指定します。適用済み・未使用の抑制はpreflight reportに残るため、黙って消えることはありません。
+
+次は抑制できません。
+
+- blocking check
+- Git repository / README / .gitignore / project manifestなどREADY判定の必須check
+- tracked secret-risk finding
+- wildcardを使った広いpath指定
+- error severityのinstruction finding
+
+不正または危険な `.cwb.json` は無視して続行せず、preflightを `NEEDS ATTENTION` にします。なお `cwb audit` は生の診断結果を確認するため、意図的に抑制を適用しません。抑制はCLI / GitHub Action / GitHub Appが共有する `preflight` 契約に適用されます。`.cwb.json` は検査対象revisionのRepo policyとして評価されるため、変更はCI設定やbranch policyと同様にレビューしてください。実際に抑制が適用された場合、GitHub Checkは `.cwb.json` にnotice annotationを表示します。
+
 ## AGENTS.md生成
 
 ```powershell
@@ -81,7 +132,7 @@ GitHub Marketplaceの再利用可能Actionとして利用できます。prefligh
 - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
   with:
     python-version: "3.13"
-- uses: kohli217/codex-workspace-bootstrap@v0.7.0
+- uses: kohli217/codex-workspace-bootstrap@v0.11.0
   with:
     path: .
     strict: "true"
@@ -174,5 +225,19 @@ Demo verification: PASS
 ```
 
 詳細は [examples/first-run-demo](../examples/first-run-demo) を参照してください。
+
+### multi-agent Pythonデモ
+
+複数のAI coding agentが同じscopeで異なる検証commandを指定した場合と、path-specific ruleを区別するデモもあります。
+
+```powershell
+py examples/multi-agent-python-demo/run_demo.py
+```
+
+修正前はrootの `AGENTS.md` が `mypy src`、`CLAUDE.md` が `pyright src` を指定するため、`typecheck` の `validation-command-drift` を1件検出します。一方、`tests/**/*.py` だけに適用されるCopilot ruleの `ruff check tests` はrepository-wide ruleとして誤比較しません。
+
+修正後はClaude側を同等のwrapper形式 `python -m mypy src` に揃え、`READY` になることまで自動検証します。ネットワーク通信やinstruction内commandの実行は行わず、Windows / Ubuntu CIで継続検証します。
+
+詳細は [examples/multi-agent-python-demo](../examples/multi-agent-python-demo) を参照してください。
 
 これは第三者利用実績の主張ではなく、製品の検出能力を再現可能な形で確認するための技術デモです。

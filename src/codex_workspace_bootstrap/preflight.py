@@ -5,6 +5,12 @@ from pathlib import Path
 
 from .agents import detect_project_signals
 from .audit import Check, audit_repository, summary
+from .config import (
+    CONFIG_FILENAME,
+    RepositoryConfigError,
+    apply_repository_config,
+    load_repository_config,
+)
 from .doctor import doctor_findings
 from .instructions import (
     InstructionFinding,
@@ -13,6 +19,9 @@ from .instructions import (
     finding_summary,
     lint_instructions,
 )
+
+
+PREFLIGHT_REPORT_SCHEMA_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -26,7 +35,20 @@ class NextAction:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class PolicyDecision:
+    passed: bool
+    failures: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "passed": self.passed,
+            "failures": list(self.failures),
+        }
+
+
 ESSENTIAL_CHECKS = {
+    "configuration",
     "git-repository",
     "readme",
     "gitignore",
@@ -108,6 +130,7 @@ def next_actions(
         )
 
     essentials = [
+        ("configuration", "Fix invalid repository preflight configuration"),
         ("git-repository", "Run from a Git repository root"),
         ("readme", "Add a README with setup and validation commands"),
         ("gitignore", "Add a project-appropriate .gitignore"),
@@ -137,10 +160,13 @@ def next_actions(
         ]
         evidence = _check_by_name(checks, "package-manager-evidence")
         if evidence is not None and evidence.status != "pass":
-            priority = "P1" if len(manager_checks) > 1 else "P2"
+            evidence_conflict = evidence.message.startswith(
+                "Conflicting Node.js package-manager evidence"
+            )
+            priority = "P1" if evidence_conflict else "P2"
             title = (
                 "Resolve conflicting repository package-manager evidence"
-                if len(manager_checks) > 1
+                if evidence_conflict
                 else "Confirm the repository package manager"
             )
             actions.append(
@@ -166,9 +192,47 @@ def next_actions(
     return actions
 
 
-def build_preflight(root: Path) -> dict[str, object]:
+def evaluate_preflight_policy(
+    report: dict[str, object],
+    *,
+    strict: bool = False,
+    fail_on_integrity: bool = False,
+    require_ready: bool = False,
+) -> PolicyDecision:
+    """Evaluate CI/App policy gates against an already-built preflight report."""
+
+    failures: list[str] = []
+    state = str(report.get("state", ""))
+    instruction_summary = report.get("instruction_summary", {})
+    findings = (
+        int(instruction_summary.get("findings", 0))
+        if isinstance(instruction_summary, dict)
+        else 0
+    )
+
+    if strict and state == "BLOCKED":
+        failures.append("blocking-findings")
+    if fail_on_integrity and findings:
+        failures.append("instruction-integrity-findings")
+    if require_ready and state != "READY":
+        failures.append("repository-not-ready")
+
+    return PolicyDecision(
+        passed=not failures,
+        failures=tuple(failures),
+    )
+
+
+def build_preflight(
+    root: Path,
+    *,
+    include_local_toolchain: bool = True,
+) -> dict[str, object]:
     root = root.resolve()
-    checks = audit_repository(root)
+    checks = audit_repository(
+        root,
+        include_local_toolchain=include_local_toolchain,
+    )
     instructions = detect_instruction_signals(root)
     instruction_findings = lint_instructions(root, instructions)
 
@@ -188,14 +252,47 @@ def build_preflight(root: Path) -> dict[str, object]:
             )
         ]
 
+    configuration: dict[str, object] | None = None
+    suppression_records: list[dict[str, object]] = []
+    try:
+        repository_config = load_repository_config(root)
+    except RepositoryConfigError as exc:
+        checks.append(
+            Check(
+                "configuration",
+                "warn",
+                f"Invalid {CONFIG_FILENAME}: {exc}",
+            )
+        )
+        configuration = {
+            "path": CONFIG_FILENAME,
+            "valid": False,
+            "error": str(exc),
+        }
+    else:
+        if repository_config is not None:
+            checks, instruction_findings, records = apply_repository_config(
+                repository_config,
+                checks,
+                instruction_findings,
+            )
+            configuration = {
+                "path": repository_config.path,
+                "version": repository_config.version,
+                "valid": True,
+            }
+            suppression_records = [item.to_dict() for item in records]
+
     instruction_totals = finding_summary(instruction_findings)
     projects = detect_project_signals(root)
     totals = summary(checks)
     state = readiness_state(checks, instructions, instruction_findings)
     actions = next_actions(checks, instructions, projects, instruction_findings)
 
-    return {
+    report: dict[str, object] = {
+        "schema_version": PREFLIGHT_REPORT_SCHEMA_VERSION,
         "repository": str(root),
+        "local_toolchain_checked": include_local_toolchain,
         "state": state,
         "project_signals": projects,
         "instruction_signals": [item.to_dict() for item in instructions],
@@ -205,6 +302,29 @@ def build_preflight(root: Path) -> dict[str, object]:
         "next_actions": [item.to_dict() for item in actions],
         "checks": [check.to_dict() for check in checks],
     }
+    if configuration is not None:
+        report["configuration"] = configuration
+        report["suppressions"] = suppression_records
+    return report
+
+
+def _state_explanation(state: str) -> str:
+    if state == "READY":
+        return (
+            "The repository satisfies CWB's current readiness and "
+            "instruction-integrity checks. This is not a security guarantee."
+        )
+    if state == "BLOCKED":
+        return (
+            "A blocking repository-risk finding is present. Review it before "
+            "allowing an AI coding agent to modify the repository."
+        )
+    if state == "NEEDS ATTENTION":
+        return (
+            "The repository may still be usable, but important readiness or "
+            "instruction findings need review before relying on agent guidance."
+        )
+    return "Review the report before relying on this repository for agent work."
 
 
 def render_markdown(report: dict[str, object]) -> str:
@@ -218,12 +338,21 @@ def render_markdown(report: dict[str, object]) -> str:
 
     project_text = ", ".join(str(item) for item in projects) if projects else "Unknown / no common manifest detected"
 
+    local_toolchain_checked = bool(report.get("local_toolchain_checked", True))
+    local_toolchain_text = (
+        "included"
+        if local_toolchain_checked
+        else "skipped (repository-only mode)"
+    )
+
     lines = [
         "# AI Repository Preflight",
         "",
         f"**State:** {state}",
+        f"**What this means:** {_state_explanation(state)}",
         "",
         f"**Project signals:** {project_text}",
+        f"**Local toolchain checks:** {local_toolchain_text}",
         f"**Audit:** {totals['passed']} passed · {totals['warnings']} warnings · {totals['blocking']} blocking",
         f"**Instruction integrity:** {instruction_totals['findings']} findings · {instruction_totals['drift']} drift · {instruction_totals['invalid_commands']} invalid commands · {instruction_totals['metadata']} metadata",
         "",
@@ -247,6 +376,47 @@ def render_markdown(report: dict[str, object]) -> str:
             lines.append(f"- **{item['kind']}** — {item['message']} ({files}) — scope: `{scope}`")
     else:
         lines.append("- No cross-agent instruction drift or invalid package scripts detected.")
+
+    suppressions = report.get("suppressions", [])
+    configuration = report.get("configuration")
+    if isinstance(configuration, dict):
+        lines.extend(["", "## Repository configuration", ""])
+        if configuration.get("valid"):
+            lines.append(
+                f"- Loaded `{configuration.get('path', CONFIG_FILENAME)}` "
+                f"(version {configuration.get('version', '?')})."
+            )
+        else:
+            lines.append(
+                f"- Invalid `{configuration.get('path', CONFIG_FILENAME)}`: "
+                f"{configuration.get('error', 'unknown configuration error')}"
+            )
+
+        if isinstance(suppressions, list) and suppressions:
+            applied = sum(
+                1
+                for item in suppressions
+                if isinstance(item, dict) and item.get("applied")
+            )
+            lines.append(
+                f"- Suppressions: {applied} applied · {len(suppressions) - applied} unused."
+            )
+            for item in suppressions:
+                if not isinstance(item, dict):
+                    continue
+                status = "APPLIED" if item.get("applied") else "UNUSED"
+                target = str(item.get("target", "suppression"))
+                if target == "check":
+                    subject = f"check `{item.get('name', '')}`"
+                else:
+                    subject = (
+                        f"instruction `{item.get('kind', '')}` for "
+                        f"`{item.get('path', '')}` in scope "
+                        f"`{item.get('scope', '.')}`"
+                    )
+                lines.append(
+                    f"- **{status}** — {subject} — {item.get('reason', '')}"
+                )
 
     lines.extend(["", "## Next actions", ""])
 

@@ -7,6 +7,9 @@ try:
 except ModuleNotFoundError:  # Python 3.10
     import tomli as tomllib
 
+from codex_workspace_bootstrap.config import CONFIG_VERSION
+from codex_workspace_bootstrap.preflight import PREFLIGHT_REPORT_SCHEMA_VERSION
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -83,3 +86,59 @@ def test_powershell_installer_default_matches_package_version() -> None:
     assert f'[string]$Version = "{version}"' in installer
     assert "releases/download/v$Version/codex_workspace_bootstrap-$Version-py3-none-any.whl" in installer
     assert 'Write-Host "  cwb preflight ."' in installer
+
+
+
+def test_v1_stability_policy_keeps_public_compatibility_anchors() -> None:
+    stability = (ROOT / "docs" / "STABILITY.md").read_text(encoding="utf-8")
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    japanese = (ROOT / "docs" / "README.ja.md").read_text(encoding="utf-8")
+    integrations = (ROOT / "docs" / "INTEGRATIONS.md").read_text(encoding="utf-8")
+    releasing = (ROOT / "docs" / "RELEASING.md").read_text(encoding="utf-8")
+
+    assert "semantic versioning" in stability.lower()
+    assert "schema_version" in stability
+    assert ".cwb.json" in stability
+    assert "Deprecation" in stability
+    assert "security" in stability.lower()
+    assert "docs/STABILITY.md" in readme
+    assert "STABILITY.md" in japanese
+    assert "STABILITY.md" in integrations
+    assert "STABILITY.md" in releasing
+
+
+
+def test_v1_release_metadata_guard() -> None:
+    data = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    version = str(data["project"]["version"])
+    major = int(version.split(".", 1)[0])
+
+    if major < 1:
+        return
+
+    classifiers = set(data["project"].get("classifiers", []))
+    assert "Development Status :: 3 - Alpha" not in classifiers
+    assert "Development Status :: 5 - Production/Stable" in classifiers
+
+    changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    assert f"## [{version}]" in changelog, (
+        f"CHANGELOG.md has no entry for v{version}"
+    )
+
+    stability = ROOT / "docs" / "STABILITY.md"
+    schemas = ROOT / "docs" / "SCHEMAS.md"
+    assert stability.is_file()
+    assert schemas.is_file()
+
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert "docs/STABILITY.md" in readme
+
+    assert PREFLIGHT_REPORT_SCHEMA_VERSION == 1
+    assert CONFIG_VERSION == 1
+
+
+
+def test_roadmap_has_no_literal_escaped_bullet_newlines() -> None:
+    roadmap = (ROOT / "docs" / "ROADMAP.md").read_text(encoding="utf-8")
+
+    assert "\\n-" not in roadmap

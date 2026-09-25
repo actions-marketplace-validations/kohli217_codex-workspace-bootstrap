@@ -40,6 +40,13 @@ class InstructionFinding:
         }
 
 
+@dataclass(frozen=True)
+class _CommandContext:
+    command: str
+    cwd: str | None = None
+    has_explicit_cwd: bool = False
+
+
 EXACT_INSTRUCTION_FILES: tuple[tuple[str, str], ...] = (
     ("GitHub Copilot", ".github/copilot-instructions.md"),
     ("Cline", ".clinerules"),
@@ -76,13 +83,34 @@ def _walk_repository(root: Path):
         dirnames[:] = [name for name in dirnames if name not in _EXCLUDED_PARTS]
         yield Path(current), dirnames, filenames
 
+_PY_VALIDATION_TOOL = (
+    r"(?:ruff\s+check(?=\s|$)|mypy(?=\s|$)|pyright(?=\s|$)|tox(?=\s|$)|nox(?=\s|$)|pre-commit\s+run(?=\s|$))"
+)
+_PY_MODULE_VALIDATION_TOOL = (
+    r"(?:ruff\s+check(?=\s|$)|mypy(?=\s|$)|tox(?=\s|$)|nox(?=\s|$)|pre_commit\s+run(?=\s|$))"
+)
+
 _COMMAND_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\b(?:uv|poetry|pdm)\s+run\s+pytest(?:\s+[^\n`]+)?", re.I),
+    re.compile(
+        rf"\b(?:uv|poetry|pdm)\s+run\s+{_PY_VALIDATION_TOOL}(?:\s+[^\n`]+)?",
+        re.I,
+    ),
     re.compile(r"\bpython\s+-m\s+pytest(?:\s+[^\n`]+)?", re.I),
+    re.compile(
+        rf"\bpython\s+-m\s+{_PY_MODULE_VALIDATION_TOOL}(?:\s+[^\n`]+)?",
+        re.I,
+    ),
     re.compile(r"(?<![\w.-])pytest(?:\s+[^\n`]+)?", re.I),
     re.compile(r"\bpython\s+-m\s+unittest(?:\s+[^\n`]+)?", re.I),
-    re.compile(r"\b(?:npm|pnpm|bun)\s+(?:run\s+)?[\w:.-]+(?:\s+[^\n`]+)?", re.I),
-    re.compile(r"\byarn\s+(?:run\s+)?[\w:.-]+(?:\s+[^\n`]+)?", re.I),
+    re.compile(r"(?<![\w.-])ruff\s+check(?=\s|$)(?:\s+[^\n`]+)?", re.I),
+    re.compile(r"(?<![\w.-])mypy(?=\s|$)(?:\s+[^\n`]+)?", re.I),
+    re.compile(r"(?<![\w.-])pyright(?=\s|$)(?:\s+[^\n`]+)?", re.I),
+    re.compile(r"(?<![\w.-])tox(?=\s|$)(?:\s+[^\n`]+)?", re.I),
+    re.compile(r"(?<![\w.-])nox(?=\s|$)(?:\s+[^\n`]+)?", re.I),
+    re.compile(r"(?<![\w.-])pre-commit\s+run(?=\s|$)(?:\s+[^\n`]+)?", re.I),
+    re.compile(r"\b(?:npm|pnpm|bun)\s+(?:run\s+)?[\w:./=@-]+(?:\s+[^\n`]+)?", re.I),
+    re.compile(r"\byarn\s+(?:run\s+)?[\w:./=@-]+(?:\s+[^\n`]+)?", re.I),
     re.compile(r"\bgo\s+test(?:\s+[^\n`]+)?", re.I),
     re.compile(r"\bcargo\s+test(?:\s+[^\n`]+)?", re.I),
     re.compile(r"(?<![\w.-])(?:make|just)\s+[\w:.-]+(?:\s+[^\n`]+)?", re.I),
@@ -308,6 +336,23 @@ def _agent_signals(root: Path) -> list[InstructionSignal]:
     return found
 
 
+def _safe_sibling_instruction_alias(path: Path, target_name: str) -> Path | None:
+    if not path.is_symlink():
+        return None
+    try:
+        lexical_target = path.readlink().as_posix()
+    except OSError:
+        return None
+
+    if lexical_target not in {target_name, f"./{target_name}"}:
+        return None
+
+    target = path.parent / target_name
+    if target.is_symlink() or not target.is_file():
+        return None
+    return target
+
+
 def _hierarchical_named_signals(
     root: Path,
     filename: str,
@@ -327,8 +372,38 @@ def _hierarchical_named_signals(
     return found
 
 
+def _safe_alias_signals(
+    root: Path,
+    alias_name: str,
+    target_name: str,
+    tool: str,
+) -> list[InstructionSignal]:
+    found: list[InstructionSignal] = []
+    for directory, _dirnames, filenames in _walk_repository(root):
+        if alias_name not in filenames:
+            continue
+        alias = directory / alias_name
+        if _safe_sibling_instruction_alias(alias, target_name) is None:
+            continue
+
+        rel = alias.relative_to(root).as_posix()
+        scope_path = directory.relative_to(root).as_posix()
+        scope = "." if scope_path == "." else scope_path
+        found.append(InstructionSignal(tool, rel, scope, "alias"))
+    return found
+
+
 def _claude_signals(root: Path) -> list[InstructionSignal]:
-    return _hierarchical_named_signals(root, "CLAUDE.md", "Claude Code")
+    found = _hierarchical_named_signals(root, "CLAUDE.md", "Claude Code")
+    found.extend(
+        _safe_alias_signals(
+            root,
+            "CLAUDE.md",
+            "AGENTS.md",
+            "Claude Code",
+        )
+    )
+    return found
 
 
 def _gemini_context_filenames(root: Path) -> tuple[str, ...]:
@@ -375,8 +450,19 @@ def _gemini_context_filenames(root: Path) -> tuple[str, ...]:
 
 def _gemini_signals(root: Path) -> list[InstructionSignal]:
     found: list[InstructionSignal] = []
-    for filename in _gemini_context_filenames(root):
+    filenames = _gemini_context_filenames(root)
+    for filename in filenames:
         found.extend(_hierarchical_named_signals(root, filename, "Gemini CLI"))
+
+    if "GEMINI.md" in filenames:
+        found.extend(
+            _safe_alias_signals(
+                root,
+                "GEMINI.md",
+                "AGENTS.md",
+                "Gemini CLI",
+            )
+        )
     return found
 
 
@@ -388,6 +474,8 @@ def _instruction_file_allowed(tool: str, path: Path) -> bool:
         return name.endswith(".instructions.md")
     if tool == "Cursor":
         return path.suffix.lower() == ".mdc"
+    if tool == "Windsurf":
+        return path.suffix.lower() in {".md", ".mdc"}
     if tool == "Continue":
         return path.suffix.lower() in {".md", ".mdc"}
     if tool == "Cline":
@@ -454,6 +542,69 @@ def _cursor_rule_signals(root: Path) -> list[InstructionSignal]:
 
     return found
 
+
+def _windsurf_rule_signals(root: Path) -> list[InstructionSignal]:
+    """Discover Windsurf workspace rules without promoting conditional rules."""
+
+    found: list[InstructionSignal] = []
+    windsurf_dirs: list[Path] = []
+
+    for directory, dirnames, _filenames in _walk_repository(root):
+        if ".windsurf" in dirnames:
+            windsurf_dirs.append(directory / ".windsurf")
+
+    for windsurf_dir in sorted(windsurf_dirs):
+        rules_dir = windsurf_dir / "rules"
+        if not rules_dir.is_dir() or rules_dir.is_symlink():
+            continue
+
+        base_dir = windsurf_dir.parent
+        base_rel = base_dir.relative_to(root).as_posix()
+        base_scope = "." if base_rel == "." else base_rel
+
+        for current, dirnames, filenames in os.walk(rules_dir):
+            dirnames[:] = [name for name in dirnames if name not in _EXCLUDED_PARTS]
+            current_path = Path(current)
+            for filename in sorted(filenames):
+                path = current_path / filename
+                if (
+                    path.is_symlink()
+                    or not path.is_file()
+                    or not _instruction_file_allowed("Windsurf", path)
+                ):
+                    continue
+
+                text = _safe_read(path)
+                trigger_raw = _frontmatter_value(text, ("trigger",))
+                trigger = trigger_raw.strip().lower() if trigger_raw else ""
+                glob_scope, has_glob_scope = _scope_metadata(text)
+
+                if trigger == "always_on":
+                    scope = base_scope
+                    kind = "repository"
+                elif trigger == "glob" and has_glob_scope:
+                    scope = _combine_scope(base_scope, glob_scope)
+                    kind = "path-specific"
+                else:
+                    scope = (
+                        _combine_scope(base_scope, glob_scope)
+                        if has_glob_scope
+                        else base_scope
+                    )
+                    kind = "conditional"
+
+                found.append(
+                    InstructionSignal(
+                        "Windsurf",
+                        path.relative_to(root).as_posix(),
+                        scope,
+                        kind,
+                    )
+                )
+
+    return found
+
+
 def detect_instruction_signals(root: Path) -> list[InstructionSignal]:
     root = root.resolve()
     found: list[InstructionSignal] = []
@@ -478,6 +629,12 @@ def detect_instruction_signals(root: Path) -> list[InstructionSignal]:
             seen.add(key)
 
     for signal in _cursor_rule_signals(root):
+        key = (signal.tool, signal.path)
+        if key not in seen:
+            found.append(signal)
+            seen.add(key)
+
+    for signal in _windsurf_rule_signals(root):
         key = (signal.tool, signal.path)
         if key not in seen:
             found.append(signal)
@@ -512,7 +669,20 @@ def detect_instruction_signals(root: Path) -> list[InstructionSignal]:
 
 
 def _read_instruction(root: Path, signal: InstructionSignal) -> str:
-    return _safe_read(root / signal.path)
+    path = root / signal.path
+    if signal.kind == "alias":
+        alias_targets = {
+            ("Claude Code", "CLAUDE.md"): "AGENTS.md",
+            ("Gemini CLI", "GEMINI.md"): "AGENTS.md",
+        }
+        target_name = alias_targets.get((signal.tool, path.name))
+        if target_name is None:
+            return ""
+        target = _safe_sibling_instruction_alias(path, target_name)
+        if target is None:
+            return ""
+        return _safe_read(target)
+    return _safe_read(path)
 
 
 def _command_regions(text: str) -> list[str]:
@@ -521,7 +691,7 @@ def _command_regions(text: str) -> list[str]:
     for raw_line in text.splitlines():
         line = raw_line.strip().lstrip("-*+> ").strip()
         if re.match(
-            r"^(?:python\s+-m\s+|pytest\b|uv\s+run\s+|poetry\s+run\s+|pdm\s+run\s+|npm\b|pnpm\b|yarn\b|bun\b|go\s+test\b|cargo\s+test\b|make\b|just\b|(?:\.\/)?gradlew?\b|(?:\.\/)?mvnw?\b|dotnet\s+test\b)",
+            r"^(?:python\s+-m\s+|pytest\b|ruff\s+check\b|mypy\b|pyright\b|tox\b|nox\b|pre-commit\s+run\b|uv\s+run\s+|poetry\s+run\s+|pdm\s+run\s+|npm\b|pnpm\b|yarn\b|bun\b|go\s+test\b|cargo\s+test\b|make\b|just\b|(?:\.\/)?gradlew?\b|(?:\.\/)?mvnw?\b|dotnet\s+test\b)",
             line,
             re.I,
         ):
@@ -529,12 +699,15 @@ def _command_regions(text: str) -> list[str]:
     return regions
 
 
-def _split_shell_chain(region: str) -> list[str]:
-    """Split common shell command chains while respecting simple quotes."""
-    parts: list[str] = []
+def _split_shell_chain_with_operators(
+    region: str,
+) -> list[tuple[str | None, str]]:
+    """Split a shell chain and retain the operator that precedes each segment."""
+    parts: list[tuple[str | None, str]] = []
     current: list[str] = []
     quote: str | None = None
     escaped = False
+    operator: str | None = None
     index = 0
 
     while index < len(region):
@@ -565,20 +738,19 @@ def _split_shell_chain(region: str) -> list[str]:
             index += 1
             continue
 
+        matched_operator: str | None = None
         if region.startswith("&&", index) or region.startswith("||", index):
-            value = "".join(current).strip()
-            if value:
-                parts.append(value)
-            current = []
-            index += 2
-            continue
+            matched_operator = region[index : index + 2]
+        elif char in {";", "|"}:
+            matched_operator = char
 
-        if char in {";", "|"}:
+        if matched_operator is not None:
             value = "".join(current).strip()
             if value:
-                parts.append(value)
+                parts.append((operator, value))
             current = []
-            index += 1
+            operator = matched_operator
+            index += len(matched_operator)
             continue
 
         current.append(char)
@@ -586,8 +758,79 @@ def _split_shell_chain(region: str) -> list[str]:
 
     value = "".join(current).strip()
     if value:
-        parts.append(value)
+        parts.append((operator, value))
     return parts
+
+
+def _split_shell_chain(region: str) -> list[str]:
+    """Split common shell command chains while respecting simple quotes."""
+    return [segment for _operator, segment in _split_shell_chain_with_operators(region)]
+
+
+def _safe_cd_target(segment: str) -> tuple[bool, str | None]:
+    try:
+        tokens = shlex.split(segment, posix=True)
+    except ValueError:
+        tokens = segment.split()
+
+    if not tokens or tokens[0] != "cd":
+        return False, None
+    if len(tokens) != 2:
+        return True, None
+
+    value = tokens[1].strip().replace("\\", "/")
+    if not value or value.startswith(("/", "~")) or re.match(r"^[A-Za-z]:/", value):
+        return True, None
+    if any(token in value for token in ("$", "%", "*", "?", "[", "]", "{", "}", "`")):
+        return True, None
+
+    parts = [part for part in value.split("/") if part not in {"", "."}]
+    if any(part == ".." for part in parts):
+        return True, None
+
+    normalized = "/".join(parts)
+    return True, normalized or "."
+
+
+def _extract_command_contexts(text: str) -> list[_CommandContext]:
+    found: list[_CommandContext] = []
+    seen: set[tuple[str, str | None, bool]] = set()
+
+    for region in _command_regions(text):
+        lines = region.splitlines() or [region]
+        for raw_line in lines:
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            cwd: str | None = None
+            has_explicit_cwd = False
+            for operator, segment in _split_shell_chain_with_operators(line):
+                if operator in {"||", "|"}:
+                    cwd = None
+                    has_explicit_cwd = True
+
+                is_cd, target = _safe_cd_target(segment)
+                if is_cd:
+                    cwd = target
+                    has_explicit_cwd = True
+                    continue
+
+                for pattern in _COMMAND_PATTERNS:
+                    for match in pattern.finditer(segment):
+                        command = " ".join(match.group(0).strip().split())
+                        key = (command.lower(), cwd, has_explicit_cwd)
+                        if command and key not in seen:
+                            found.append(
+                                _CommandContext(
+                                    command,
+                                    cwd,
+                                    has_explicit_cwd,
+                                )
+                            )
+                            seen.add(key)
+
+    return found
 
 
 def extract_commands(text: str) -> list[str]:
@@ -684,12 +927,392 @@ def _repo_package_managers(root: Path, scope: str) -> set[str]:
     return set()
 
 
-def _script_names(root: Path, scope: str) -> set[str]:
+def _script_names(root: Path, scope: str) -> set[str] | None:
     for directory in _directory_chain_to_root(root, scope):
-        _managers, scripts = _package_evidence_at(directory)
-        if scripts or (directory / "package.json").is_file():
+        package_path = directory / "package.json"
+        if package_path.is_file() and not package_path.is_symlink():
+            _managers, scripts = _package_evidence_at(directory)
             return scripts
-    return set()
+    return None
+
+
+def _workspace_target_for_command(command: str) -> tuple[bool, str | None]:
+    tokens = _package_command_tokens(command.strip())
+    if not tokens:
+        return False, None
+
+    manager = tokens[0].lower()
+    if manager not in {"npm", "pnpm", "yarn", "bun"}:
+        return False, None
+
+    if manager == "yarn" and len(tokens) >= 3 and tokens[1] == "workspace":
+        return True, tokens[2]
+
+    if manager == "npm":
+        targets: list[str] = []
+        index = 1
+        while index < len(tokens):
+            token = tokens[index]
+            if token == "--":
+                break
+            if token in {"--workspace", "-w"}:
+                if index + 1 < len(tokens):
+                    targets.append(tokens[index + 1])
+                else:
+                    targets.append("")
+                index += 2
+                continue
+            if token.startswith("--workspace="):
+                targets.append(token[len("--workspace="):])
+                index += 1
+                continue
+            if token.startswith("-w="):
+                targets.append(token[len("-w="):])
+                index += 1
+                continue
+            index += 1
+
+        if not targets:
+            return False, None
+        nonempty = [target for target in targets if target]
+        if len(nonempty) != 1 or len(targets) != 1:
+            return True, None
+        return True, nonempty[0]
+
+    if manager == "pnpm":
+        targets: list[str] = []
+        index = 1
+        while index < len(tokens):
+            token = tokens[index]
+            if token == "--":
+                break
+            if token in {"--filter", "-F"}:
+                if index + 1 < len(tokens):
+                    targets.append(tokens[index + 1])
+                else:
+                    targets.append("")
+                index += 2
+                continue
+            if token.startswith("--filter="):
+                targets.append(token[len("--filter="):])
+                index += 1
+                continue
+            if token.startswith("-F="):
+                targets.append(token[len("-F="):])
+                index += 1
+                continue
+            index += 1
+
+        if not targets:
+            return False, None
+        nonempty = [target for target in targets if target]
+        if len(nonempty) != 1 or len(targets) != 1:
+            return True, None
+        return True, nonempty[0]
+
+    target_options = {"--filter", "-F", "--workspace", "-w"}
+    target_long_options = {"--filter", "--workspace"}
+    directory_options = {"--dir", "-C", "--prefix", "--cwd"}
+    directory_long_options = {"--dir", "--prefix", "--cwd"}
+    targets: list[str] = []
+
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token in target_options:
+            if index + 1 < len(tokens):
+                targets.append(tokens[index + 1])
+            else:
+                targets.append("")
+            index += 2
+            continue
+
+        matched_inline = False
+        for option in target_long_options:
+            prefix = f"{option}="
+            if token.startswith(prefix):
+                targets.append(token[len(prefix):])
+                matched_inline = True
+                break
+        if matched_inline:
+            index += 1
+            continue
+
+        if token in directory_options:
+            index += 2
+            continue
+        if any(token.startswith(f"{option}=") for option in directory_long_options):
+            index += 1
+            continue
+
+        if not token.startswith("-"):
+            break
+        index += 1
+
+    if not targets:
+        return False, None
+
+    nonempty = [target for target in targets if target]
+    if len(nonempty) != 1 or len(targets) != 1:
+        return True, None
+    return True, nonempty[0]
+
+
+def _directory_target_for_command(command: str) -> tuple[bool, str | None]:
+    tokens = _package_command_tokens(command.strip())
+    if not tokens:
+        return False, None
+
+    manager = tokens[0].lower()
+    if manager not in {"npm", "pnpm", "yarn", "bun"}:
+        return False, None
+
+    supported_options: set[str]
+    supported_long_options: set[str]
+    if manager == "pnpm":
+        supported_options = {"--dir", "-C"}
+        supported_long_options = {"--dir"}
+    elif manager == "npm":
+        supported_options = {"--prefix"}
+        supported_long_options = {"--prefix"}
+    elif manager in {"yarn", "bun"}:
+        supported_options = {"--cwd"}
+        supported_long_options = {"--cwd"}
+    else:
+        return False, None
+
+    targets: list[str] = []
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+
+        # npm accepts global config options such as --prefix both before and
+        # after the command/script name. Only scan until npm's "--" separator;
+        # everything after it belongs to the script being invoked.
+        if manager == "npm" and token == "--":
+            break
+
+        if token in supported_options:
+            if index + 1 < len(tokens):
+                targets.append(tokens[index + 1])
+            else:
+                targets.append("")
+            index += 2
+            continue
+
+        matched_inline = False
+        for option in supported_long_options:
+            prefix = f"{option}="
+            if token.startswith(prefix):
+                targets.append(token[len(prefix):])
+                matched_inline = True
+                break
+        if matched_inline:
+            index += 1
+            continue
+
+        if manager == "npm":
+            index += 1
+            continue
+
+        if token in {"--filter", "-F", "--workspace", "-w"}:
+            index += 2
+            continue
+        if token.startswith(("--filter=", "--workspace=")):
+            index += 1
+            continue
+
+        if manager == "yarn" and token == "workspace":
+            break
+        if not token.startswith("-"):
+            break
+        index += 1
+
+    if not targets:
+        return False, None
+    nonempty = [target for target in targets if target]
+    if len(nonempty) != 1 or len(targets) != 1:
+        return True, None
+    return True, nonempty[0]
+
+
+def _safe_repository_directory(root: Path, target: str) -> Path | None:
+    value = target.strip().replace("\\", "/")
+    if not value or value.startswith("/") or re.match(r"^[A-Za-z]:/", value):
+        return None
+
+    parts = [part for part in value.split("/") if part not in {"", "."}]
+    if any(part == ".." for part in parts):
+        return None
+
+    candidate = root.joinpath(*parts) if parts else root
+    try:
+        candidate.resolve().relative_to(root.resolve())
+    except (OSError, ValueError):
+        return None
+    return candidate
+
+
+def _directory_script_names(root: Path, target: str) -> set[str] | None:
+    directory = _safe_repository_directory(root, target)
+    if directory is None:
+        return None
+
+    package_path = directory / "package.json"
+    if not package_path.is_file() or package_path.is_symlink():
+        return None
+
+    package = _package_json(package_path)
+    raw_scripts = package.get("scripts")
+    if not isinstance(raw_scripts, dict):
+        return set()
+    return {
+        str(name)
+        for name, value in raw_scripts.items()
+        if isinstance(name, str) and isinstance(value, str)
+    }
+
+
+def _exact_pnpm_path_filter_script_names(root: Path, target: str) -> set[str] | None:
+    value = target.strip().replace("\\", "/")
+    if not value.startswith("./"):
+        return None
+
+    if any(token in value for token in ("*", "?", "[", "]", "{", "}", "...")):
+        return None
+    if value.startswith("./!") or value == "./":
+        return None
+
+    return _directory_script_names(root, value)
+
+
+def _exact_npm_workspace_directory_script_names(
+    root: Path,
+    target: str,
+) -> set[str] | None:
+    value = target.strip().replace("\\", "/")
+    if not value:
+        return None
+    if any(token in value for token in ("*", "?", "[", "]", "{", "}")):
+        return None
+
+    return _directory_script_names(root, value)
+
+
+def _workspace_script_names(root: Path, target: str) -> set[str] | None:
+    matches: list[set[str]] = []
+    for directory, _dirnames, filenames in _walk_repository(root):
+        if "package.json" not in filenames:
+            continue
+        package_path = directory / "package.json"
+        package = _package_json(package_path)
+        if package.get("name") != target:
+            continue
+        raw_scripts = package.get("scripts")
+        if isinstance(raw_scripts, dict):
+            scripts = {
+                str(name)
+                for name, value in raw_scripts.items()
+                if isinstance(name, str) and isinstance(value, str)
+            }
+        else:
+            scripts = set()
+        matches.append(scripts)
+
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
+def _is_pnpm_recursive_command(command: str) -> bool:
+    tokens = _package_command_tokens(command.strip())
+    if not tokens or tokens[0].lower() != "pnpm":
+        return False
+
+    for token in tokens[1:]:
+        if token == "--":
+            break
+        if token in {"-r", "--recursive"}:
+            return True
+    return False
+
+
+def _is_npm_workspaces_command(command: str) -> bool:
+    tokens = _package_command_tokens(command.strip())
+    if not tokens or tokens[0].lower() != "npm":
+        return False
+
+    for token in tokens[1:]:
+        if token == "--":
+            break
+        if token in {"--workspaces", "-ws"}:
+            return True
+    return False
+
+
+def _script_names_for_command(root: Path, scope: str, command: str) -> set[str] | None:
+    has_workspace_target, workspace_target = _workspace_target_for_command(command)
+    if has_workspace_target:
+        if workspace_target is None:
+            return None
+
+        manager = _manager_for_command(command)
+        if manager == "pnpm" and workspace_target.startswith("./"):
+            return _exact_pnpm_path_filter_script_names(root, workspace_target)
+
+        scripts = _workspace_script_names(root, workspace_target)
+        if scripts is not None:
+            return scripts
+
+        if manager == "npm":
+            return _exact_npm_workspace_directory_script_names(
+                root,
+                workspace_target,
+            )
+        return None
+
+    if _is_pnpm_recursive_command(command):
+        # Recursive pnpm commands fan out over workspace projects. Without an
+        # exact filter, a single root/nearest package.json is not sufficient
+        # evidence for whether the recursive script is valid.
+        return None
+
+    if _is_npm_workspaces_command(command):
+        # npm --workspaces / -ws similarly fans the command out over the
+        # configured workspaces. Without a single --workspace/-w target,
+        # root/nearest package.json evidence is insufficient.
+        return None
+
+    has_directory_target, directory_target = _directory_target_for_command(command)
+    if has_directory_target:
+        if directory_target is None:
+            return None
+        return _directory_script_names(root, directory_target)
+
+    return _script_names(root, scope)
+
+
+def _script_names_for_context(
+    root: Path,
+    scope: str,
+    context: _CommandContext,
+) -> set[str] | None:
+    if not context.has_explicit_cwd:
+        return _script_names_for_command(root, scope, context.command)
+
+    if context.cwd is None or scope != ".":
+        return None
+
+    has_workspace_target, _workspace_target = _workspace_target_for_command(context.command)
+    has_directory_target, _directory_target = _directory_target_for_command(context.command)
+    if has_workspace_target or has_directory_target:
+        return None
+    if _is_pnpm_recursive_command(context.command):
+        return None
+    if _is_npm_workspaces_command(context.command):
+        return None
+
+    return _directory_script_names(root, context.cwd)
 
 
 def _manager_for_command(command: str) -> str | None:
@@ -767,6 +1390,30 @@ def _script_for_command(command: str) -> tuple[str, str, bool] | None:
 
 def _validation_key(command: str) -> str | None:
     lowered = " ".join(command.lower().split())
+
+    normalized = lowered
+    for prefix in ("uv run ", "poetry run ", "pdm run "):
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix):]
+            break
+    if normalized.startswith("python -m "):
+        normalized = normalized[len("python -m "):]
+    if normalized.startswith("pre_commit run"):
+        normalized = "pre-commit run" + normalized[len("pre_commit run"):]
+
+    if re.match(r"^ruff\s+check\b", normalized):
+        return "lint:ruff"
+    if re.match(r"^mypy\b", normalized):
+        return "typecheck:mypy"
+    if re.match(r"^pyright\b", normalized):
+        return "typecheck:pyright"
+    if re.match(r"^tox\b", normalized):
+        return "test:tox"
+    if re.match(r"^nox\b", normalized):
+        return "test:nox"
+    if re.match(r"^pre-commit\s+run\b", normalized):
+        return "check:pre-commit"
+
     if "pytest" in lowered:
         return "test:pytest"
     if "unittest" in lowered:
@@ -831,10 +1478,12 @@ def lint_instructions(
     root = root.resolve()
     signals = signals if signals is not None else detect_instruction_signals(root)
     per_file_commands: dict[str, list[str]] = {}
+    per_file_contexts: dict[str, list[_CommandContext]] = {}
 
     for signal in signals:
         text = _read_instruction(root, signal)
         per_file_commands[signal.path] = extract_commands(text) if text else []
+        per_file_contexts[signal.path] = _extract_command_contexts(text) if text else []
 
     findings: list[InstructionFinding] = []
     signal_by_path = {signal.path: signal for signal in signals}
@@ -876,7 +1525,6 @@ def lint_instructions(
             instruction_managers[path] = managers
 
         repo_managers = _repo_package_managers(root, signal.scope)
-        scripts = _script_names(root, signal.scope)
 
         if len(repo_managers) == 1:
             expected = next(iter(repo_managers))
@@ -893,23 +1541,34 @@ def lint_instructions(
                     )
                 )
 
-        if scripts:
-            for command in commands:
-                parsed = _script_for_command(command)
-                if not parsed:
-                    continue
-                _manager, script, explicit_run = parsed
-                if script not in scripts and (script == "test" or explicit_run):
-                    findings.append(
-                        InstructionFinding(
-                            "missing-package-script",
-                            "warning",
-                            f"{path} references '{command}', but the nearest package.json for scope '{signal.scope}' has no '{script}' script.",
-                            (path,),
-                            (command,),
-                            signal.scope,
-                        )
+        contexts = per_file_contexts.get(path) or [
+            _CommandContext(command) for command in commands
+        ]
+        for context in contexts:
+            command = context.command
+            parsed = _script_for_command(command)
+            if not parsed:
+                continue
+            scripts = _script_names_for_context(root, signal.scope, context)
+            if scripts is None:
+                continue
+            _manager, script, explicit_run = parsed
+            if script not in scripts and (script == "test" or explicit_run):
+                cwd_note = (
+                    f" after cd '{context.cwd}'"
+                    if context.has_explicit_cwd and context.cwd is not None
+                    else ""
+                )
+                findings.append(
+                    InstructionFinding(
+                        "missing-package-script",
+                        "warning",
+                        f"{path} references '{command}'{cwd_note}, but the targeted or nearest package.json for scope '{signal.scope}' has no '{script}' script.",
+                        (path,),
+                        (command,),
+                        signal.scope,
                     )
+                )
 
     for scope, per_file in _same_scope_groups(signals, instruction_managers).items():
         manager_sets = {manager for managers in per_file.values() for manager in managers}

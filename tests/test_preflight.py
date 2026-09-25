@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 import shutil
 import subprocess
 
@@ -6,8 +7,10 @@ import pytest
 
 from codex_workspace_bootstrap.audit import Check
 from codex_workspace_bootstrap.preflight import (
+    PREFLIGHT_REPORT_SCHEMA_VERSION,
     build_preflight,
     detect_instruction_signals,
+    evaluate_preflight_policy,
     readiness_state,
     next_actions,
     render_markdown,
@@ -94,6 +97,54 @@ def test_markdown_report_is_human_readable(tmp_path: Path) -> None:
     assert "# AI Repository Preflight" in markdown
     assert "**State:** READY" in markdown
     assert "Codex / OpenAI agents" in markdown
+
+
+@pytest.mark.parametrize(
+    ("state", "expected"),
+    [
+        (
+            "READY",
+            "The repository satisfies CWB's current readiness and "
+            "instruction-integrity checks. This is not a security guarantee.",
+        ),
+        (
+            "NEEDS ATTENTION",
+            "important readiness or instruction findings need review",
+        ),
+        (
+            "BLOCKED",
+            "Review it before allowing an AI coding agent to modify the repository.",
+        ),
+    ],
+)
+def test_markdown_explains_each_preflight_state(
+    state: str,
+    expected: str,
+) -> None:
+    report = {
+        "state": state,
+        "project_signals": [],
+        "instruction_signals": [],
+        "instruction_findings": [],
+        "instruction_summary": {
+            "findings": 0,
+            "drift": 0,
+            "invalid_commands": 0,
+            "metadata": 0,
+        },
+        "summary": {
+            "passed": 0,
+            "warnings": 0,
+            "blocking": 1 if state == "BLOCKED" else 0,
+        },
+        "next_actions": [],
+    }
+
+    markdown = render_markdown(report)
+
+    assert f"**State:** {state}" in markdown
+    assert "**What this means:**" in markdown
+    assert expected in markdown
 
 
 def test_readiness_needs_attention_with_only_scoped_instruction() -> None:
@@ -295,3 +346,281 @@ def test_build_preflight_keeps_nested_package_manager_conflict(
     ]
 
     assert len(nested_conflicts) == 1
+
+
+def test_preflight_report_declares_schema_version(tmp_path: Path) -> None:
+    report = build_preflight(tmp_path)
+
+    assert report["schema_version"] == PREFLIGHT_REPORT_SCHEMA_VERSION
+    assert PREFLIGHT_REPORT_SCHEMA_VERSION == 1
+
+
+@pytest.mark.parametrize(
+    ("report", "options", "expected_passed", "expected_failures"),
+    [
+        (
+            {"state": "BLOCKED", "instruction_summary": {"findings": 0}},
+            {"strict": True},
+            False,
+            ("blocking-findings",),
+        ),
+        (
+            {"state": "NEEDS ATTENTION", "instruction_summary": {"findings": 2}},
+            {"fail_on_integrity": True},
+            False,
+            ("instruction-integrity-findings",),
+        ),
+        (
+            {"state": "NEEDS ATTENTION", "instruction_summary": {"findings": 0}},
+            {"require_ready": True},
+            False,
+            ("repository-not-ready",),
+        ),
+        (
+            {"state": "READY", "instruction_summary": {"findings": 0}},
+            {"strict": True, "fail_on_integrity": True, "require_ready": True},
+            True,
+            (),
+        ),
+    ],
+)
+def test_evaluate_preflight_policy(
+    report: dict[str, object],
+    options: dict[str, bool],
+    expected_passed: bool,
+    expected_failures: tuple[str, ...],
+) -> None:
+    decision = evaluate_preflight_policy(report, **options)
+
+    assert decision.passed is expected_passed
+    assert decision.failures == expected_failures
+    assert decision.to_dict() == {
+        "passed": expected_passed,
+        "failures": list(expected_failures),
+    }
+
+
+def test_preflight_policy_reports_all_enabled_failures() -> None:
+    report = {
+        "state": "BLOCKED",
+        "instruction_summary": {"findings": 3},
+    }
+
+    decision = evaluate_preflight_policy(
+        report,
+        strict=True,
+        fail_on_integrity=True,
+        require_ready=True,
+    )
+
+    assert decision.passed is False
+    assert decision.failures == (
+        "blocking-findings",
+        "instruction-integrity-findings",
+        "repository-not-ready",
+    )
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git is required")
+def test_repository_only_preflight_is_independent_of_host_toolchain(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    subprocess.run(("git", "-C", str(tmp_path), "init"), check=True, capture_output=True, text=True)
+    (tmp_path / "README.md").write_text("# demo\n", encoding="utf-8")
+    (tmp_path / ".gitignore").write_text(".venv/\n", encoding="utf-8")
+    (tmp_path / "package.json").write_text(
+        '{"packageManager":"pnpm@10","scripts":{"test":"vitest"}}',
+        encoding="utf-8",
+    )
+    (tmp_path / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+    (tmp_path / "AGENTS.md").write_text("Run §pnpm test§.\n".replace("§", "`"), encoding="utf-8")
+
+    def fail_tool_check(label: str, command: tuple[str, ...]) -> Check:
+        raise AssertionError(f"local tool check should not run: {label} {command}")
+
+    monkeypatch.setattr("codex_workspace_bootstrap.audit._tool_check", fail_tool_check)
+
+    report = build_preflight(tmp_path, include_local_toolchain=False)
+
+    assert report["local_toolchain_checked"] is False
+    assert report["state"] == "READY"
+    assert not {
+        "git",
+        "python",
+        "node",
+        "powershell",
+        "wsl",
+        "codex",
+        "npm",
+        "pnpm",
+        "yarn",
+        "bun",
+    }.intersection(item["name"] for item in report["checks"])
+    assert "**Local toolchain checks:** skipped (repository-only mode)" in render_markdown(report)
+
+
+def test_next_actions_keeps_package_manager_conflict_high_priority_without_tool_checks() -> None:
+    checks = [
+        Check(
+            "package-manager-evidence",
+            "warn",
+            "Conflicting Node.js package-manager evidence detected: npm, pnpm",
+        ),
+    ]
+
+    actions = next_actions(checks, [], ["Node.js"])
+
+    assert any(
+        item.priority == "P1"
+        and item.title == "Resolve conflicting repository package-manager evidence"
+        for item in actions
+    )
+
+
+
+def _write_ready_repository(root: Path) -> None:
+    (root / ".git").mkdir()
+    (root / "README.md").write_text("# demo\n", encoding="utf-8")
+    (root / ".gitignore").write_text(".venv/\n", encoding="utf-8")
+    (root / "package.json").write_text(
+        '{"packageManager":"pnpm@10","scripts":{"test":"echo ok"}}',
+        encoding="utf-8",
+    )
+    (root / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+
+
+def test_preflight_applies_exact_instruction_suppression(tmp_path: Path) -> None:
+    _write_ready_repository(tmp_path)
+    (tmp_path / "AGENTS.md").write_text(
+        "Run §npm test§.\n".replace("§", "`"),
+        encoding="utf-8",
+    )
+    (tmp_path / ".cwb.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "suppress": {
+                    "instruction_findings": [
+                        {
+                            "kind": "package-manager-mismatch",
+                            "path": "AGENTS.md",
+                            "scope": ".",
+                            "reason": "The compatibility command is intentional.",
+                        }
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = build_preflight(tmp_path, include_local_toolchain=False)
+
+    assert report["state"] == "READY"
+    assert report["instruction_findings"] == []
+    assert report["instruction_summary"]["findings"] == 0
+    assert report["configuration"] == {
+        "path": ".cwb.json",
+        "version": 1,
+        "valid": True,
+    }
+    suppressions = report["suppressions"]
+    assert len(suppressions) == 1
+    assert suppressions[0]["applied"] is True
+    assert suppressions[0]["reason"] == "The compatibility command is intentional."
+
+    markdown = render_markdown(report)
+    assert "## Repository configuration" in markdown
+    assert "**APPLIED**" in markdown
+    assert "package-manager-mismatch" in markdown
+
+
+def test_preflight_keeps_unused_suppression_visible(tmp_path: Path) -> None:
+    _write_ready_repository(tmp_path)
+    (tmp_path / "AGENTS.md").write_text(
+        "Run §pnpm test§.\n".replace("§", "`"),
+        encoding="utf-8",
+    )
+    (tmp_path / ".cwb.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "suppress": {
+                    "checks": [
+                        {
+                            "name": "license",
+                            "reason": "Only relevant when the warning exists.",
+                        }
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = build_preflight(tmp_path, include_local_toolchain=False)
+
+    suppressions = report["suppressions"]
+    assert suppressions[0]["applied"] is True
+
+    (tmp_path / "LICENSE").write_text("MIT\n", encoding="utf-8")
+    report = build_preflight(tmp_path, include_local_toolchain=False)
+
+    suppressions = report["suppressions"]
+    assert suppressions[0]["applied"] is False
+    assert "**UNUSED**" in render_markdown(report)
+
+
+def test_invalid_repository_config_fails_closed(tmp_path: Path) -> None:
+    _write_ready_repository(tmp_path)
+    (tmp_path / "AGENTS.md").write_text(
+        "Run §pnpm test§.\n".replace("§", "`"),
+        encoding="utf-8",
+    )
+    (tmp_path / ".cwb.json").write_text("{not-json", encoding="utf-8")
+
+    report = build_preflight(tmp_path, include_local_toolchain=False)
+
+    assert report["state"] == "NEEDS ATTENTION"
+    configuration = report["configuration"]
+    assert configuration["valid"] is False
+    config_checks = [
+        item for item in report["checks"] if item["name"] == "configuration"
+    ]
+    assert len(config_checks) == 1
+    assert config_checks[0]["status"] == "warn"
+    assert any(
+        item["title"] == "Fix invalid repository preflight configuration"
+        for item in report["next_actions"]
+    )
+
+
+def test_repository_config_cannot_suppress_essential_readiness(tmp_path: Path) -> None:
+    _write_ready_repository(tmp_path)
+    (tmp_path / "AGENTS.md").write_text(
+        "Run §pnpm test§.\n".replace("§", "`"),
+        encoding="utf-8",
+    )
+    (tmp_path / ".cwb.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "suppress": {
+                    "checks": [
+                        {
+                            "name": "readme",
+                            "reason": "Attempted unsafe exception.",
+                        }
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = build_preflight(tmp_path, include_local_toolchain=False)
+
+    assert report["state"] == "NEEDS ATTENTION"
+    assert report["configuration"]["valid"] is False
+    assert any(item["name"] == "readme" for item in report["checks"])

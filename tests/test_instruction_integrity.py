@@ -31,6 +31,117 @@ You can also use §python -m pytest§ for the Python package.
     assert "npm" not in commands
 
 
+def test_common_python_validation_commands_are_recognized() -> None:
+    text = """
+§§§bash
+ruff check .
+mypy src
+pyright src
+tox -q
+nox -s tests
+pre-commit run --all-files
+uv run ruff check .
+poetry run mypy src
+pdm run tox -q
+python -m ruff check .
+python -m mypy src
+python -m tox -q
+python -m nox -s tests
+python -m pre_commit run --all-files
+§§§
+""".replace("§", "`")
+
+    commands = extract_commands(text)
+
+    expected = {
+        "ruff check .",
+        "mypy src",
+        "pyright src",
+        "tox -q",
+        "nox -s tests",
+        "pre-commit run --all-files",
+        "uv run ruff check .",
+        "poetry run mypy src",
+        "pdm run tox -q",
+        "python -m ruff check .",
+        "python -m mypy src",
+        "python -m tox -q",
+        "python -m nox -s tests",
+        "python -m pre_commit run --all-files",
+    }
+    assert expected.issubset(set(commands))
+
+
+def test_python_validation_wrapper_equivalence_avoids_false_drift(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "AGENTS.md").write_text(
+        "Run §ruff check .§ and §mypy src§.\n".replace("§", "`"),
+        encoding="utf-8",
+    )
+    (tmp_path / "CLAUDE.md").write_text(
+        "Run §uv run ruff check .§ and §python -m mypy src§.\n".replace("§", "`"),
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    assert not any(item.kind == "validation-command-drift" for item in findings)
+
+
+def test_python_validation_typecheck_drift_is_reported(tmp_path: Path) -> None:
+    (tmp_path / "AGENTS.md").write_text(
+        "Run §mypy src§.\n".replace("§", "`"),
+        encoding="utf-8",
+    )
+    (tmp_path / "CLAUDE.md").write_text(
+        "Run §pyright src§.\n".replace("§", "`"),
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    drift = [item for item in findings if item.kind == "validation-command-drift"]
+    assert len(drift) == 1
+    assert "typecheck" in drift[0].message
+    assert any("typecheck:mypy" in item for item in drift[0].evidence)
+    assert any("typecheck:pyright" in item for item in drift[0].evidence)
+
+
+def test_pre_commit_wrapper_equivalence_avoids_false_drift(tmp_path: Path) -> None:
+    (tmp_path / "AGENTS.md").write_text(
+        "Run §pre-commit run --all-files§.\n".replace("§", "`"),
+        encoding="utf-8",
+    )
+    (tmp_path / "CLAUDE.md").write_text(
+        "Run §uv run pre-commit run --all-files§.\n".replace("§", "`"),
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    assert not any(item.kind == "validation-command-drift" for item in findings)
+
+
+def test_python_validation_tool_names_in_prose_are_not_commands() -> None:
+    commands = extract_commands(
+        "Use Ruff for linting, mypy for typing, and tox for test orchestration."
+    )
+
+    assert commands == []
+
+
+def test_python_validation_config_filenames_are_not_commands() -> None:
+    commands = extract_commands(
+        "Review §mypy.ini§, §pyrightconfig.json§, and §noxfile.py§.".replace(
+            "§",
+            "`",
+        )
+    )
+
+    assert commands == []
+
+
 def test_package_manager_mismatch_uses_repo_evidence(tmp_path: Path) -> None:
     (tmp_path / "package.json").write_text(
         json.dumps(
@@ -429,6 +540,105 @@ def test_multiline_globs_stop_at_next_frontmatter_key(tmp_path: Path) -> None:
     assert signal.kind == "path-specific"
 
 
+def test_windsurf_rules_preserve_trigger_semantics(tmp_path: Path) -> None:
+    rules = tmp_path / ".windsurf" / "rules"
+    rules.mkdir(parents=True)
+    (rules / "standards.md").write_text(
+        "---\ntrigger: always_on\ndescription:\nglobs:\n---\n"
+        "Validate with §mypy src§.\n".replace("§", "`"),
+        encoding="utf-8",
+    )
+    (rules / "python.md").write_text(
+        "---\ntrigger: glob\nglobs: services/api/**/*.py\n---\n"
+        "Validate with §ruff check services/api§.\n".replace("§", "`"),
+        encoding="utf-8",
+    )
+    (rules / "package.md").write_text(
+        "---\ntrigger: model_decision\nglobs: package.json\n---\n"
+        "Use pnpm for package changes.\n",
+        encoding="utf-8",
+    )
+    (rules / "unknown.mdc").write_text(
+        "---\nglobs: apps/web/**/*.ts\n---\n"
+        "Use the web conventions.\n",
+        encoding="utf-8",
+    )
+
+    signals = detect_instruction_signals(tmp_path)
+    by_name = {
+        Path(item.path).name: item
+        for item in signals
+        if item.tool == "Windsurf"
+    }
+
+    assert by_name["standards.md"].scope == "."
+    assert by_name["standards.md"].kind == "repository"
+    assert by_name["python.md"].scope == "services/api"
+    assert by_name["python.md"].kind == "path-specific"
+    assert by_name["package.md"].kind == "conditional"
+    assert by_name["unknown.mdc"].scope == "apps/web"
+    assert by_name["unknown.mdc"].kind == "conditional"
+
+
+def test_windsurf_glob_without_scope_stays_conditional(tmp_path: Path) -> None:
+    rules = tmp_path / ".windsurf" / "rules"
+    rules.mkdir(parents=True)
+    (rules / "incomplete.md").write_text(
+        "---\ntrigger: glob\nglobs:\n---\n"
+        "Validate carefully.\n",
+        encoding="utf-8",
+    )
+
+    signal = next(
+        item
+        for item in detect_instruction_signals(tmp_path)
+        if item.tool == "Windsurf"
+    )
+
+    assert signal.scope == "."
+    assert signal.kind == "conditional"
+
+
+def test_windsurf_rules_ignore_non_rule_extensions(tmp_path: Path) -> None:
+    rules = tmp_path / ".windsurf" / "rules"
+    rules.mkdir(parents=True)
+    (rules / "notes.txt").write_text("trigger: always_on\n", encoding="utf-8")
+    (rules / "standards.md").write_text(
+        "---\ntrigger: always_on\n---\nRepository rules.\n",
+        encoding="utf-8",
+    )
+
+    paths = {
+        item.path
+        for item in detect_instruction_signals(tmp_path)
+        if item.tool == "Windsurf"
+    }
+
+    assert ".windsurf/rules/standards.md" in paths
+    assert ".windsurf/rules/notes.txt" not in paths
+
+
+def test_windsurf_conditional_rule_is_excluded_from_cross_file_drift(
+    tmp_path: Path,
+) -> None:
+    rules = tmp_path / ".windsurf" / "rules"
+    rules.mkdir(parents=True)
+    (rules / "always.md").write_text(
+        "---\ntrigger: always_on\n---\n"
+        "Validate with §mypy src§.\n".replace("§", "`"),
+        encoding="utf-8",
+    )
+    (rules / "model.md").write_text(
+        "---\ntrigger: model_decision\n---\n"
+        "Validate with §pyright src§ when relevant.\n".replace("§", "`"),
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    assert not any(item.kind == "validation-command-drift" for item in findings)
+
+
 def test_instruction_discovery_prunes_large_generated_directories(tmp_path: Path) -> None:
     (tmp_path / "AGENTS.md").write_text("root\n", encoding="utf-8")
 
@@ -735,6 +945,12 @@ def test_pnpm_filter_command_validates_real_script_name(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     (tmp_path / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+    web = tmp_path / "packages" / "web"
+    web.mkdir(parents=True)
+    (web / "package.json").write_text(
+        json.dumps({"name": "web", "scripts": {"test": "vitest"}}),
+        encoding="utf-8",
+    )
     (tmp_path / "AGENTS.md").write_text(
         "Run §pnpm --filter web run lint§.\n".replace("§", "`"),
         encoding="utf-8",
@@ -779,6 +995,12 @@ def test_npm_workspace_flag_validates_real_script_name(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     (tmp_path / "package-lock.json").write_text("{}", encoding="utf-8")
+    app = tmp_path / "packages" / "app"
+    app.mkdir(parents=True)
+    (app / "package.json").write_text(
+        json.dumps({"name": "app", "scripts": {"test": "vitest"}}),
+        encoding="utf-8",
+    )
     (tmp_path / "AGENTS.md").write_text(
         "Run §npm --workspace app run lint§.\n".replace("§", "`"),
         encoding="utf-8",
@@ -833,3 +1055,1238 @@ def test_embedded_brace_glob_keeps_parent_static_scope(tmp_path: Path) -> None:
 
     assert signal.kind == "path-specific"
     assert signal.scope == "apps/web"
+
+
+def test_pnpm_filter_validates_target_workspace_script(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text(
+        json.dumps({"packageManager": "pnpm@11", "scripts": {"test": "turbo test"}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+    package = tmp_path / "packages" / "core"
+    package.mkdir(parents=True)
+    (package / "package.json").write_text(
+        json.dumps({"name": "@demo/core", "scripts": {"dev": "vite"}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "AGENTS.md").write_text(
+        "Run `pnpm --filter @demo/core run dev`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    assert not any(item.kind == "missing-package-script" for item in findings)
+
+
+def test_pnpm_filter_reports_script_missing_from_target_workspace(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text(
+        json.dumps({"packageManager": "pnpm@11", "scripts": {"dev": "vite"}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+    package = tmp_path / "packages" / "core"
+    package.mkdir(parents=True)
+    (package / "package.json").write_text(
+        json.dumps({"name": "@demo/core", "scripts": {"test": "vitest"}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "AGENTS.md").write_text(
+        "Run `pnpm --filter @demo/core run dev`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    missing = [item for item in findings if item.kind == "missing-package-script"]
+    assert len(missing) == 1
+    assert "dev" in missing[0].message
+
+
+def test_npm_workspace_validates_target_workspace_script(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text(
+        json.dumps({"packageManager": "npm@11", "scripts": {}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "package-lock.json").write_text("{}\n", encoding="utf-8")
+    package = tmp_path / "packages" / "web"
+    package.mkdir(parents=True)
+    (package / "package.json").write_text(
+        json.dumps({"name": "@demo/web", "scripts": {"lint": "eslint ."}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "AGENTS.md").write_text(
+        "Run `npm --workspace @demo/web run lint`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    assert not any(item.kind == "missing-package-script" for item in findings)
+
+
+def test_yarn_workspace_validates_target_workspace_script(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text(
+        json.dumps({"packageManager": "yarn@4", "scripts": {}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "yarn.lock").write_text("", encoding="utf-8")
+    package = tmp_path / "packages" / "web"
+    package.mkdir(parents=True)
+    (package / "package.json").write_text(
+        json.dumps({"name": "@demo/web", "scripts": {"test": "vitest"}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "AGENTS.md").write_text(
+        "Run `yarn workspace @demo/web test`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    assert not any(item.kind == "missing-package-script" for item in findings)
+
+
+def test_unresolved_workspace_selector_does_not_fall_back_to_root_scripts(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text(
+        json.dumps({"packageManager": "pnpm@11", "scripts": {}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+    (tmp_path / "AGENTS.md").write_text(
+        "Run `pnpm --filter './packages/**' run test`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    assert not any(item.kind == "missing-package-script" for item in findings)
+
+
+def test_pnpm_directory_target_uses_target_package_scripts(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text(
+        json.dumps({"packageManager": "pnpm@10", "scripts": {}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    (frontend / "package.json").write_text(
+        json.dumps({"scripts": {"test": "jest"}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "AGENTS.md").write_text(
+        "Run `pnpm -C frontend test`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    assert not any(item.kind == "missing-package-script" for item in findings)
+
+
+def test_pnpm_directory_target_reports_missing_script_in_target(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text(
+        json.dumps({"packageManager": "pnpm@10", "scripts": {"lint": "eslint ."}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    (frontend / "package.json").write_text(
+        json.dumps({"scripts": {"test": "jest"}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "AGENTS.md").write_text(
+        "Run `pnpm --dir=frontend run lint`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    missing = [item for item in findings if item.kind == "missing-package-script"]
+    assert len(missing) == 1
+    assert "lint" in missing[0].message
+
+
+def test_directory_target_path_traversal_does_not_read_outside_repo(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text(
+        json.dumps({"packageManager": "pnpm@10", "scripts": {}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+    (tmp_path / "AGENTS.md").write_text(
+        "Run `pnpm -C ../outside run test`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    assert not any(item.kind == "missing-package-script" for item in findings)
+
+
+def test_extract_commands_keeps_yarn_inline_cwd_value() -> None:
+    commands = extract_commands(
+        "Preview with `yarn --cwd=website start` and validate with "
+        "`yarn --cwd=website build`."
+    )
+
+    assert "yarn --cwd=website start" in commands
+    assert "yarn --cwd=website build" in commands
+
+
+def test_yarn_inline_cwd_uses_target_package_scripts(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text(
+        json.dumps({"packageManager": "yarn@4", "scripts": {}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "yarn.lock").write_text("", encoding="utf-8")
+    website = tmp_path / "website"
+    website.mkdir()
+    (website / "package.json").write_text(
+        json.dumps({"scripts": {"start": "docusaurus start"}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "AGENTS.md").write_text(
+        "Run `yarn --cwd=website start`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    assert not any(item.kind == "missing-package-script" for item in findings)
+
+
+def test_yarn_inline_cwd_reports_missing_script_in_target(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text(
+        json.dumps({"packageManager": "yarn@4", "scripts": {"build": "echo root"}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "yarn.lock").write_text("", encoding="utf-8")
+    website = tmp_path / "website"
+    website.mkdir()
+    (website / "package.json").write_text(
+        json.dumps({"scripts": {"start": "docusaurus start"}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "AGENTS.md").write_text(
+        "Run `yarn --cwd=website run build`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    missing = [item for item in findings if item.kind == "missing-package-script"]
+    assert len(missing) == 1
+    assert "build" in missing[0].message
+
+
+def test_npm_post_script_workspace_flags_use_target_package_scripts(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text(
+        json.dumps({"packageManager": "npm@11", "scripts": {}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "package-lock.json").write_text("{}\n", encoding="utf-8")
+    web = tmp_path / "packages" / "web"
+    web.mkdir(parents=True)
+    (web / "package.json").write_text(
+        json.dumps({"name": "@demo/web", "scripts": {"lint": "eslint ."}}),
+        encoding="utf-8",
+    )
+
+    commands = (
+        "npm run lint --workspace=@demo/web",
+        "npm run lint --workspace @demo/web",
+        "npm run lint -w @demo/web",
+        "npm run lint -w=@demo/web",
+    )
+    for command in commands:
+        (tmp_path / "AGENTS.md").write_text(
+            f"Run `{command}`.\n",
+            encoding="utf-8",
+        )
+        findings = lint_instructions(tmp_path)
+        assert not any(
+            item.kind == "missing-package-script"
+            for item in findings
+        ), command
+
+
+def test_npm_post_script_workspace_reports_missing_script_in_target(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text(
+        json.dumps({"packageManager": "npm@11", "scripts": {"lint": "eslint root"}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "package-lock.json").write_text("{}\n", encoding="utf-8")
+    web = tmp_path / "packages" / "web"
+    web.mkdir(parents=True)
+    (web / "package.json").write_text(
+        json.dumps({"name": "@demo/web", "scripts": {"test": "vitest"}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "AGENTS.md").write_text(
+        "Run `npm run lint --workspace=@demo/web`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    missing = [item for item in findings if item.kind == "missing-package-script"]
+    assert len(missing) == 1
+    assert "lint" in missing[0].message
+
+
+def test_npm_script_argument_separator_stops_workspace_resolution(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text(
+        json.dumps({"packageManager": "npm@11", "scripts": {"test": "vitest root"}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "package-lock.json").write_text("{}\n", encoding="utf-8")
+    web = tmp_path / "packages" / "web"
+    web.mkdir(parents=True)
+    (web / "package.json").write_text(
+        json.dumps({"name": "@demo/web", "scripts": {}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "AGENTS.md").write_text(
+        "Run `npm run test -- --workspace=@demo/web`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    assert not any(item.kind == "missing-package-script" for item in findings)
+
+
+def test_safe_claude_agents_alias_is_detected_without_following_link(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    (tmp_path / "package.json").write_text(
+        json.dumps({"scripts": {"test": "vitest"}}),
+        encoding="utf-8",
+    )
+    agents = tmp_path / "AGENTS.md"
+    agents.write_text(
+        "Run `npm run lint`.\n",
+        encoding="utf-8",
+    )
+    claude = tmp_path / "CLAUDE.md"
+    claude.write_text("AGENTS.md", encoding="utf-8")
+
+    original_is_symlink = Path.is_symlink
+    original_readlink = Path.readlink
+
+    def fake_is_symlink(path: Path) -> bool:
+        if path == claude:
+            return True
+        return original_is_symlink(path)
+
+    def fake_readlink(path: Path) -> Path:
+        if path == claude:
+            return Path("AGENTS.md")
+        return original_readlink(path)
+
+    monkeypatch.setattr(Path, "is_symlink", fake_is_symlink)
+    monkeypatch.setattr(Path, "readlink", fake_readlink)
+
+    signals = detect_instruction_signals(tmp_path)
+    alias = next(
+        item
+        for item in signals
+        if item.tool == "Claude Code" and item.path == "CLAUDE.md"
+    )
+
+    assert alias.kind == "alias"
+    findings = lint_instructions(tmp_path, [alias])
+    assert any(item.kind == "missing-package-script" for item in findings)
+
+
+def test_claude_alias_rejects_parent_traversal(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    (tmp_path / "AGENTS.md").write_text("root\n", encoding="utf-8")
+    claude = tmp_path / "CLAUDE.md"
+    claude.write_text("../AGENTS.md", encoding="utf-8")
+
+    original_is_symlink = Path.is_symlink
+    original_readlink = Path.readlink
+
+    def fake_is_symlink(path: Path) -> bool:
+        if path == claude:
+            return True
+        return original_is_symlink(path)
+
+    def fake_readlink(path: Path) -> Path:
+        if path == claude:
+            return Path("../AGENTS.md")
+        return original_readlink(path)
+
+    monkeypatch.setattr(Path, "is_symlink", fake_is_symlink)
+    monkeypatch.setattr(Path, "readlink", fake_readlink)
+
+    signals = detect_instruction_signals(tmp_path)
+
+    assert not any(
+        item.tool == "Claude Code" and item.path == "CLAUDE.md"
+        for item in signals
+    )
+
+
+def test_claude_alias_rejects_symlinked_agents_target(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    agents = tmp_path / "AGENTS.md"
+    agents.write_text("root\n", encoding="utf-8")
+    claude = tmp_path / "CLAUDE.md"
+    claude.write_text("AGENTS.md", encoding="utf-8")
+
+    original_is_symlink = Path.is_symlink
+    original_readlink = Path.readlink
+
+    def fake_is_symlink(path: Path) -> bool:
+        if path in {claude, agents}:
+            return True
+        return original_is_symlink(path)
+
+    def fake_readlink(path: Path) -> Path:
+        if path == claude:
+            return Path("AGENTS.md")
+        return original_readlink(path)
+
+    monkeypatch.setattr(Path, "is_symlink", fake_is_symlink)
+    monkeypatch.setattr(Path, "readlink", fake_readlink)
+
+    signals = detect_instruction_signals(tmp_path)
+
+    assert not any(
+        item.tool == "Claude Code" and item.path == "CLAUDE.md"
+        for item in signals
+    )
+
+
+def test_safe_gemini_agents_alias_is_detected_and_linted(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    (tmp_path / "package.json").write_text(
+        json.dumps({"scripts": {"test": "vitest"}}),
+        encoding="utf-8",
+    )
+    agents = tmp_path / "AGENTS.md"
+    agents.write_text(
+        "Run `npm run lint`.\n",
+        encoding="utf-8",
+    )
+    gemini = tmp_path / "GEMINI.md"
+    gemini.write_text("AGENTS.md", encoding="utf-8")
+
+    original_is_symlink = Path.is_symlink
+    original_readlink = Path.readlink
+
+    def fake_is_symlink(path: Path) -> bool:
+        if path == gemini:
+            return True
+        return original_is_symlink(path)
+
+    def fake_readlink(path: Path) -> Path:
+        if path == gemini:
+            return Path("AGENTS.md")
+        return original_readlink(path)
+
+    monkeypatch.setattr(Path, "is_symlink", fake_is_symlink)
+    monkeypatch.setattr(Path, "readlink", fake_readlink)
+
+    signals = detect_instruction_signals(tmp_path)
+    alias = next(
+        item
+        for item in signals
+        if item.tool == "Gemini CLI" and item.path == "GEMINI.md"
+    )
+
+    assert alias.kind == "alias"
+    findings = lint_instructions(tmp_path, [alias])
+    assert any(item.kind == "missing-package-script" for item in findings)
+
+
+def test_gemini_alias_is_not_used_when_context_filename_excludes_gemini(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    agents = tmp_path / "AGENTS.md"
+    agents.write_text("Use shared instructions.\n", encoding="utf-8")
+    gemini = tmp_path / "GEMINI.md"
+    gemini.write_text("AGENTS.md", encoding="utf-8")
+    settings = tmp_path / ".gemini"
+    settings.mkdir()
+    (settings / "settings.json").write_text(
+        json.dumps({"context": {"fileName": ["AGENTS.md"]}}),
+        encoding="utf-8",
+    )
+
+    original_is_symlink = Path.is_symlink
+    original_readlink = Path.readlink
+
+    def fake_is_symlink(path: Path) -> bool:
+        if path == gemini:
+            return True
+        return original_is_symlink(path)
+
+    def fake_readlink(path: Path) -> Path:
+        if path == gemini:
+            return Path("AGENTS.md")
+        return original_readlink(path)
+
+    monkeypatch.setattr(Path, "is_symlink", fake_is_symlink)
+    monkeypatch.setattr(Path, "readlink", fake_readlink)
+
+    signals = detect_instruction_signals(tmp_path)
+
+    assert any(
+        item.tool == "Gemini CLI" and item.path == "AGENTS.md"
+        for item in signals
+    )
+    assert not any(
+        item.tool == "Gemini CLI" and item.path == "GEMINI.md"
+        for item in signals
+    )
+
+
+def test_pnpm_exact_path_filter_uses_target_package_scripts(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text(
+        json.dumps({"packageManager": "pnpm@10", "scripts": {}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+    api = tmp_path / "api"
+    api.mkdir()
+    (api / "package.json").write_text(
+        json.dumps({"name": "@demo/api", "scripts": {"test": "vitest"}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "AGENTS.md").write_text(
+        "Run `pnpm --filter ./api test`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    assert not any(item.kind == "missing-package-script" for item in findings)
+
+
+def test_pnpm_exact_path_filter_reports_missing_script_in_target(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text(
+        json.dumps({"packageManager": "pnpm@10", "scripts": {"lint": "eslint root"}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+    api = tmp_path / "api"
+    api.mkdir()
+    (api / "package.json").write_text(
+        json.dumps({"name": "@demo/api", "scripts": {"test": "vitest"}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "AGENTS.md").write_text(
+        "Run `pnpm --filter ./api run lint`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    missing = [item for item in findings if item.kind == "missing-package-script"]
+    assert len(missing) == 1
+    assert "lint" in missing[0].message
+
+
+def test_pnpm_complex_path_filter_stays_unresolved(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text(
+        json.dumps({"packageManager": "pnpm@10", "scripts": {}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+    api = tmp_path / "api"
+    api.mkdir()
+    (api / "package.json").write_text(
+        json.dumps({"name": "@demo/api", "scripts": {}}),
+        encoding="utf-8",
+    )
+
+    for selector in ("./api...", "./packages/**", "./../outside"):
+        (tmp_path / "AGENTS.md").write_text(
+            f"Run `pnpm --filter '{selector}' run lint`.\n",
+            encoding="utf-8",
+        )
+        findings = lint_instructions(tmp_path)
+        assert not any(item.kind == "missing-package-script" for item in findings), selector
+
+
+def test_extract_commands_stays_stable_for_cd_package_chain() -> None:
+    commands = extract_commands("Run `cd frontend && pnpm test`.")
+
+    assert commands == ["pnpm test"]
+
+
+def test_cd_context_uses_target_package_scripts(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text(
+        json.dumps({"packageManager": "pnpm@10", "scripts": {"lint": "eslint ."}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    (frontend / "package.json").write_text(
+        json.dumps({"packageManager": "pnpm@10", "scripts": {"test": "vitest"}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "AGENTS.md").write_text(
+        "Run `cd frontend && pnpm test`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    assert not any(item.kind == "missing-package-script" for item in findings)
+
+
+def test_cd_context_reports_missing_script_in_target(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text(
+        json.dumps({"packageManager": "pnpm@10", "scripts": {"test": "vitest root"}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    (frontend / "package.json").write_text(
+        json.dumps({"packageManager": "pnpm@10", "scripts": {"lint": "eslint ."}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "AGENTS.md").write_text(
+        "Run `cd frontend && pnpm test`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    missing = [item for item in findings if item.kind == "missing-package-script"]
+    assert len(missing) == 1
+    assert "after cd 'frontend'" in missing[0].message
+
+
+def test_quoted_cd_context_uses_target_package_scripts(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text(
+        json.dumps({"packageManager": "npm@11", "scripts": {}}),
+        encoding="utf-8",
+    )
+    frontend = tmp_path / "frontend app"
+    frontend.mkdir()
+    (frontend / "package.json").write_text(
+        json.dumps({"scripts": {"test": "vitest"}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "AGENTS.md").write_text(
+        'Run `cd "frontend app" && npm test`.\n',
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    assert not any(item.kind == "missing-package-script" for item in findings)
+
+
+def test_unsafe_cd_context_does_not_fall_back_to_root_scripts(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text(
+        json.dumps({"packageManager": "pnpm@10", "scripts": {}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+    (tmp_path / "AGENTS.md").write_text(
+        "Run `cd ../outside && pnpm test`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    assert not any(item.kind == "missing-package-script" for item in findings)
+
+
+def test_cd_context_with_nested_package_routing_stays_unresolved(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text(
+        json.dumps({"packageManager": "pnpm@10", "scripts": {}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    (frontend / "package.json").write_text(
+        json.dumps({"scripts": {}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "AGENTS.md").write_text(
+        "Run `cd frontend && pnpm --filter ./app run test`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    assert not any(item.kind == "missing-package-script" for item in findings)
+
+
+def test_npm_post_script_prefix_uses_target_package_scripts(tmp_path: Path) -> None:
+    app = tmp_path / "apps" / "web"
+    app.mkdir(parents=True)
+    (app / "package.json").write_text(
+        json.dumps({"scripts": {"test": "vitest", "build": "vite build"}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "AGENTS.md").write_text(
+        "Run `npm test --prefix apps/web` and "
+        "`npm run build --prefix=apps/web`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    assert not any(item.kind == "missing-package-script" for item in findings)
+
+
+def test_npm_post_script_prefix_reports_missing_target_script(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text(
+        json.dumps({"scripts": {"test": "vitest root"}}),
+        encoding="utf-8",
+    )
+    app = tmp_path / "apps" / "web"
+    app.mkdir(parents=True)
+    (app / "package.json").write_text(
+        json.dumps({"scripts": {"build": "vite build"}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "AGENTS.md").write_text(
+        "Run `npm test --prefix apps/web`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    missing = [item for item in findings if item.kind == "missing-package-script"]
+    assert len(missing) == 1
+    assert "test" in missing[0].message
+
+
+def test_npm_prefix_after_double_dash_is_script_argument(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text(
+        json.dumps({"scripts": {"test": "vitest"}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "AGENTS.md").write_text(
+        "Run `npm test -- --prefix apps/web`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    assert not any(item.kind == "missing-package-script" for item in findings)
+
+
+def test_npm_repeated_prefix_stays_unresolved(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text(
+        json.dumps({"scripts": {}}),
+        encoding="utf-8",
+    )
+    first = tmp_path / "apps" / "one"
+    second = tmp_path / "apps" / "two"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+    (first / "package.json").write_text(
+        json.dumps({"scripts": {}}),
+        encoding="utf-8",
+    )
+    (second / "package.json").write_text(
+        json.dumps({"scripts": {}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "AGENTS.md").write_text(
+        "Run `npm test --prefix apps/one --prefix apps/two`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    assert not any(item.kind == "missing-package-script" for item in findings)
+
+
+def test_pnpm_post_script_filter_uses_target_workspace_scripts(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text(
+        json.dumps({"packageManager": "pnpm@9", "scripts": {"test": "turbo test"}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+    core = tmp_path / "packages" / "core"
+    core.mkdir(parents=True)
+    (core / "package.json").write_text(
+        json.dumps({"name": "@demo/core", "scripts": {"test": "vitest"}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "AGENTS.md").write_text(
+        "Run `pnpm test --filter=@demo/core`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    assert not any(item.kind == "missing-package-script" for item in findings)
+
+
+def test_pnpm_post_script_filter_reports_missing_workspace_script(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text(
+        json.dumps({"packageManager": "pnpm@9", "scripts": {"test": "turbo test"}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+    core = tmp_path / "packages" / "core"
+    core.mkdir(parents=True)
+    (core / "package.json").write_text(
+        json.dumps({"name": "@demo/core", "scripts": {"build": "tsc"}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "AGENTS.md").write_text(
+        "Run `pnpm test --filter @demo/core`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    missing = [item for item in findings if item.kind == "missing-package-script"]
+    assert len(missing) == 1
+    assert "test" in missing[0].message
+
+
+def test_pnpm_post_script_short_filter_uses_target_workspace(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text(
+        json.dumps({"packageManager": "pnpm@9", "scripts": {}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+    core = tmp_path / "packages" / "core"
+    core.mkdir(parents=True)
+    (core / "package.json").write_text(
+        json.dumps({"name": "@demo/core", "scripts": {"test": "vitest"}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "AGENTS.md").write_text(
+        "Run `pnpm test -F=@demo/core`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    assert not any(item.kind == "missing-package-script" for item in findings)
+
+
+def test_pnpm_post_script_path_filter_uses_target_directory(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text(
+        json.dumps({"packageManager": "pnpm@9", "scripts": {}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+    core = tmp_path / "packages" / "core"
+    core.mkdir(parents=True)
+    (core / "package.json").write_text(
+        json.dumps({"name": "@demo/core", "scripts": {"test": "vitest"}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "AGENTS.md").write_text(
+        "Run `pnpm test --filter ./packages/core`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    assert not any(item.kind == "missing-package-script" for item in findings)
+
+
+def test_pnpm_filter_after_double_dash_is_script_argument(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text(
+        json.dumps({"packageManager": "pnpm@9", "scripts": {"test": "vitest"}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+    (tmp_path / "AGENTS.md").write_text(
+        "Run `pnpm test -- --filter @demo/core`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    assert not any(item.kind == "missing-package-script" for item in findings)
+
+
+def test_pnpm_repeated_post_script_filters_stay_unresolved(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text(
+        json.dumps({"packageManager": "pnpm@9", "scripts": {}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+    for name in ("core", "web"):
+        package = tmp_path / "packages" / name
+        package.mkdir(parents=True)
+        (package / "package.json").write_text(
+            json.dumps({"name": f"@demo/{name}", "scripts": {}}),
+            encoding="utf-8",
+        )
+    (tmp_path / "AGENTS.md").write_text(
+        "Run `pnpm test --filter @demo/core --filter @demo/web`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    assert not any(item.kind == "missing-package-script" for item in findings)
+
+
+def test_pnpm_recursive_command_does_not_require_root_script(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text(
+        json.dumps({"packageManager": "pnpm@12", "scripts": {}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+    package = tmp_path / "packages" / "core"
+    package.mkdir(parents=True)
+    (package / "package.json").write_text(
+        json.dumps({"name": "@demo/core", "scripts": {"test": "vitest"}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "AGENTS.md").write_text(
+        "Run `pnpm -r test`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    assert not any(item.kind == "missing-package-script" for item in findings)
+
+
+def test_pnpm_long_recursive_command_does_not_require_root_script(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text(
+        json.dumps({"packageManager": "pnpm@12", "scripts": {}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+    package = tmp_path / "packages" / "core"
+    package.mkdir(parents=True)
+    (package / "package.json").write_text(
+        json.dumps({"name": "@demo/core", "scripts": {"test": "vitest"}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "AGENTS.md").write_text(
+        "Run `pnpm --recursive test`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    assert not any(item.kind == "missing-package-script" for item in findings)
+
+
+def test_pnpm_recursive_exact_filter_still_validates_selected_workspace(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text(
+        json.dumps({"packageManager": "pnpm@12", "scripts": {"test": "vitest root"}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+    package = tmp_path / "packages" / "core"
+    package.mkdir(parents=True)
+    (package / "package.json").write_text(
+        json.dumps({"name": "@demo/core", "scripts": {"build": "tsc"}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "AGENTS.md").write_text(
+        "Run `pnpm -r test --filter @demo/core`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    missing = [item for item in findings if item.kind == "missing-package-script"]
+    assert len(missing) == 1
+    assert "test" in missing[0].message
+
+
+def test_pnpm_recursive_marker_after_double_dash_is_script_argument(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text(
+        json.dumps({"packageManager": "pnpm@12", "scripts": {}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+    (tmp_path / "AGENTS.md").write_text(
+        "Run `pnpm test -- -r`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    missing = [item for item in findings if item.kind == "missing-package-script"]
+    assert len(missing) == 1
+
+
+def test_cd_context_pnpm_recursive_command_does_not_use_cwd_package_only(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "package.json").write_text(
+        json.dumps({"packageManager": "pnpm@12", "scripts": {}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "AGENTS.md").write_text(
+        "Run `cd workspace && pnpm -r test`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    assert not any(item.kind == "missing-package-script" for item in findings)
+
+
+def test_npm_workspaces_command_does_not_require_root_script(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text(
+        json.dumps(
+            {
+                "workspaces": ["apps/*"],
+                "scripts": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    app = tmp_path / "apps" / "web"
+    app.mkdir(parents=True)
+    (app / "package.json").write_text(
+        json.dumps({"name": "@demo/web", "scripts": {"test": "vitest"}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "AGENTS.md").write_text(
+        "Run `npm test --workspaces`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    assert not any(item.kind == "missing-package-script" for item in findings)
+
+
+def test_npm_short_workspaces_command_does_not_require_root_script(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text(
+        json.dumps({"workspaces": ["packages/*"], "scripts": {}}),
+        encoding="utf-8",
+    )
+    package = tmp_path / "packages" / "core"
+    package.mkdir(parents=True)
+    (package / "package.json").write_text(
+        json.dumps({"name": "@demo/core", "scripts": {"test": "vitest"}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "AGENTS.md").write_text(
+        "Run `npm test -ws`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    assert not any(item.kind == "missing-package-script" for item in findings)
+
+
+def test_npm_exact_workspace_target_still_validates_selected_workspace(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "package.json").write_text(
+        json.dumps(
+            {
+                "workspaces": ["apps/*"],
+                "scripts": {"test": "vitest root"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    app = tmp_path / "apps" / "web"
+    app.mkdir(parents=True)
+    (app / "package.json").write_text(
+        json.dumps({"name": "@demo/web", "scripts": {"build": "vite build"}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "AGENTS.md").write_text(
+        "Run `npm test --workspace @demo/web`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    missing = [item for item in findings if item.kind == "missing-package-script"]
+    assert len(missing) == 1
+    assert "test" in missing[0].message
+
+
+def test_npm_workspaces_after_double_dash_is_script_argument(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text(
+        json.dumps({"scripts": {}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "AGENTS.md").write_text(
+        "Run `npm test -- --workspaces`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    missing = [item for item in findings if item.kind == "missing-package-script"]
+    assert len(missing) == 1
+
+
+def test_cd_context_npm_workspaces_does_not_use_cwd_package_only(
+    tmp_path: Path,
+) -> None:
+    plugins = tmp_path / "plugins"
+    plugins.mkdir()
+    (plugins / "package.json").write_text(
+        json.dumps({"workspaces": ["packages/*"], "scripts": {}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "AGENTS.md").write_text(
+        "Run `cd plugins && npm test --workspaces`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    assert not any(item.kind == "missing-package-script" for item in findings)
+
+
+def test_npm_workspace_directory_selector_uses_target_package_scripts(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "package.json").write_text(
+        json.dumps(
+            {
+                "workspaces": ["packages/backend"],
+                "scripts": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    backend = tmp_path / "packages" / "backend"
+    backend.mkdir(parents=True)
+    (backend / "package.json").write_text(
+        json.dumps(
+            {
+                "name": "@demo/backend",
+                "scripts": {"test": "vitest"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "AGENTS.md").write_text(
+        "Run `npm --workspace=packages/backend test`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    assert not any(item.kind == "missing-package-script" for item in findings)
+
+
+def test_npm_workspace_directory_selector_reports_missing_target_script(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "package.json").write_text(
+        json.dumps(
+            {
+                "workspaces": ["packages/backend"],
+                "scripts": {"test": "vitest root"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    backend = tmp_path / "packages" / "backend"
+    backend.mkdir(parents=True)
+    (backend / "package.json").write_text(
+        json.dumps(
+            {
+                "name": "@demo/backend",
+                "scripts": {"build": "tsc"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "AGENTS.md").write_text(
+        "Run `npm --workspace packages/backend test`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    missing = [item for item in findings if item.kind == "missing-package-script"]
+    assert len(missing) == 1
+    assert "test" in missing[0].message
+
+
+def test_npm_workspace_package_name_resolution_still_wins_over_directory_fallback(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "package.json").write_text(
+        json.dumps({"workspaces": ["packages/*"], "scripts": {}}),
+        encoding="utf-8",
+    )
+    named = tmp_path / "packages" / "core"
+    named.mkdir(parents=True)
+    (named / "package.json").write_text(
+        json.dumps({"name": "@demo/core", "scripts": {"test": "vitest"}}),
+        encoding="utf-8",
+    )
+    misleading = tmp_path / "@demo" / "core"
+    misleading.mkdir(parents=True)
+    (misleading / "package.json").write_text(
+        json.dumps({"name": "not-the-workspace", "scripts": {}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "AGENTS.md").write_text(
+        "Run `npm test --workspace=@demo/core`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    assert not any(item.kind == "missing-package-script" for item in findings)
+
+
+def test_npm_unsafe_workspace_directory_selector_stays_unresolved(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text(
+        json.dumps({"workspaces": ["packages/*"], "scripts": {}}),
+        encoding="utf-8",
+    )
+
+    for selector in ("../outside", "/tmp/outside", "packages/*"):
+        (tmp_path / "AGENTS.md").write_text(
+            f"Run `npm test --workspace={selector}`.\n",
+            encoding="utf-8",
+        )
+        findings = lint_instructions(tmp_path)
+        assert not any(item.kind == "missing-package-script" for item in findings), selector
+
+
+def test_npm_workspace_directory_selector_after_double_dash_is_script_argument(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "package.json").write_text(
+        json.dumps({"scripts": {}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "AGENTS.md").write_text(
+        "Run `npm test -- --workspace=packages/backend`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    missing = [item for item in findings if item.kind == "missing-package-script"]
+    assert len(missing) == 1
+

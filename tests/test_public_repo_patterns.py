@@ -1,7 +1,7 @@
 from pathlib import Path
 import json
 
-from codex_workspace_bootstrap.instructions import detect_instruction_signals, lint_instructions
+from codex_workspace_bootstrap.instructions import detect_instruction_signals, extract_commands, lint_instructions
 
 
 def test_public_pattern_openai_codex_pnpm_repo_without_js_command_drift(tmp_path: Path) -> None:
@@ -94,3 +94,688 @@ def test_public_pattern_vscode_brace_wrapped_apply_to_keeps_static_scope(tmp_pat
 
     assert signal.kind == "path-specific"
     assert signal.scope == "src/vs"
+
+
+def test_public_pattern_fit_framework_gemini_reads_agents_md(tmp_path: Path) -> None:
+    """Pattern observed in ModelEngine-Group/fit-framework at e2f285d: Gemini reads AGENTS.md."""
+    gemini = tmp_path / ".gemini"
+    gemini.mkdir()
+    (gemini / "settings.json").write_text(
+        json.dumps({"context": {"fileName": ["AGENTS.md"]}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "AGENTS.md").write_text(
+        "Validate with `mvn clean install`.\n",
+        encoding="utf-8",
+    )
+
+    signals = detect_instruction_signals(tmp_path)
+
+    assert any(
+        item.tool == "Codex / OpenAI agents" and item.path == "AGENTS.md"
+        for item in signals
+    )
+    assert any(
+        item.tool == "Gemini CLI" and item.path == "AGENTS.md"
+        for item in signals
+    )
+    assert not any(
+        item.tool == "Gemini CLI" and item.path == "GEMINI.md"
+        for item in signals
+    )
+
+
+def test_public_pattern_d3plus_workspace_filter_uses_workspace_script(tmp_path: Path) -> None:
+    """Pattern observed in d3plus/d3plus at 2818442: root AGENTS targets @d3plus/core."""
+    (tmp_path / "package.json").write_text(
+        json.dumps(
+            {
+                "packageManager": "pnpm@11.10.0",
+                "scripts": {
+                    "test": "pnpm -r --if-present run test",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+    core = tmp_path / "packages" / "core"
+    core.mkdir(parents=True)
+    (core / "package.json").write_text(
+        json.dumps(
+            {
+                "name": "@d3plus/core",
+                "scripts": {
+                    "dev": "node ../../scripts/dev.js",
+                    "test": "mocha",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "AGENTS.md").write_text(
+        "Run `pnpm --filter @d3plus/core run dev` for the core dev server.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    assert not any(item.kind == "missing-package-script" for item in findings)
+
+
+def test_public_pattern_tracecat_directory_target_uses_frontend_package(tmp_path: Path) -> None:
+    """Pattern observed in TracecatHQ/tracecat at 45eb759: root AGENTS targets frontend."""
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    (frontend / "package.json").write_text(
+        json.dumps(
+            {
+                "packageManager": "pnpm@10.30.3",
+                "scripts": {
+                    "test": "jest",
+                    "lint": "pnpm exec biome lint .",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "AGENTS.md").write_text(
+        "Validate frontend changes with `pnpm -C frontend test`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    assert not any(item.kind == "missing-package-script" for item in findings)
+
+
+def test_public_pattern_warp_yarn_inline_cwd_uses_website_package(tmp_path: Path) -> None:
+    """Pattern observed in broadinstitute/warp at 8005650: inline Yarn cwd targets website."""
+    website = tmp_path / "website"
+    website.mkdir()
+    (website / "package.json").write_text(
+        json.dumps(
+            {
+                "scripts": {
+                    "start": "docusaurus start",
+                    "build": "docusaurus build",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    instruction_text = (
+        "Preview with `yarn --cwd=website start` and validate with "
+        "`yarn --cwd=website build`.\n"
+    )
+    (tmp_path / "AGENTS.md").write_text(instruction_text, encoding="utf-8")
+
+    commands = extract_commands(instruction_text)
+    findings = lint_instructions(tmp_path)
+
+    assert "yarn --cwd=website start" in commands
+    assert "yarn --cwd=website build" in commands
+    assert not any(item.kind == "missing-package-script" for item in findings)
+
+
+def test_public_pattern_wordpress_npm_post_script_workspace_uses_workspace_script(
+    tmp_path: Path,
+) -> None:
+    """Pattern observed in WordPress/pattern-directory at 4482f38."""
+    (tmp_path / "package.json").write_text(
+        json.dumps(
+            {
+                "name": "wporg-pattern-directory-project",
+                "private": True,
+                "scripts": {
+                    "test:php": "wp-env run phpunit",
+                },
+                "workspaces": [
+                    "public_html/wp-content/plugins/pattern-creator",
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "package-lock.json").write_text("{}\n", encoding="utf-8")
+    creator = (
+        tmp_path
+        / "public_html"
+        / "wp-content"
+        / "plugins"
+        / "pattern-creator"
+    )
+    creator.mkdir(parents=True)
+    (creator / "package.json").write_text(
+        json.dumps(
+            {
+                "name": "wporg-pattern-creator",
+                "scripts": {
+                    "test:unit": "wp-scripts test-unit-js",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "AGENTS.md").write_text(
+        "Run JS tests with "
+        "`npm run test:unit --workspace=wporg-pattern-creator`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    assert not any(item.kind == "missing-package-script" for item in findings)
+
+
+def test_public_pattern_vtex_claude_alias_reuses_regular_agents(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Pattern observed in vtex/address-form at 2643de3: CLAUDE.md -> AGENTS.md."""
+    agents = tmp_path / "AGENTS.md"
+    agents.write_text(
+        "Use Yarn. Validate with `yarn test`.\n",
+        encoding="utf-8",
+    )
+    claude = tmp_path / "CLAUDE.md"
+    claude.write_text("AGENTS.md", encoding="utf-8")
+
+    original_is_symlink = Path.is_symlink
+    original_readlink = Path.readlink
+
+    def fake_is_symlink(path: Path) -> bool:
+        if path == claude:
+            return True
+        return original_is_symlink(path)
+
+    def fake_readlink(path: Path) -> Path:
+        if path == claude:
+            return Path("AGENTS.md")
+        return original_readlink(path)
+
+    monkeypatch.setattr(Path, "is_symlink", fake_is_symlink)
+    monkeypatch.setattr(Path, "readlink", fake_readlink)
+
+    signals = detect_instruction_signals(tmp_path)
+    pairs = {(item.tool, item.path, item.kind) for item in signals}
+
+    assert ("Codex / OpenAI agents", "AGENTS.md", "repository") in pairs
+    assert ("Claude Code", "CLAUDE.md", "alias") in pairs
+
+
+def test_public_pattern_cissp_shared_claude_and_gemini_aliases(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Pattern observed in kickflip-labs/cissp-study-hub at 1f92eb8."""
+    agents = tmp_path / "AGENTS.md"
+    agents.write_text(
+        "Shared repository guidance.\n",
+        encoding="utf-8",
+    )
+    claude = tmp_path / "CLAUDE.md"
+    gemini = tmp_path / "GEMINI.md"
+    claude.write_text("AGENTS.md", encoding="utf-8")
+    gemini.write_text("AGENTS.md", encoding="utf-8")
+
+    original_is_symlink = Path.is_symlink
+    original_readlink = Path.readlink
+
+    def fake_is_symlink(path: Path) -> bool:
+        if path in {claude, gemini}:
+            return True
+        return original_is_symlink(path)
+
+    def fake_readlink(path: Path) -> Path:
+        if path in {claude, gemini}:
+            return Path("AGENTS.md")
+        return original_readlink(path)
+
+    monkeypatch.setattr(Path, "is_symlink", fake_is_symlink)
+    monkeypatch.setattr(Path, "readlink", fake_readlink)
+
+    signals = detect_instruction_signals(tmp_path)
+    pairs = {(item.tool, item.path, item.kind) for item in signals}
+
+    assert ("Codex / OpenAI agents", "AGENTS.md", "repository") in pairs
+    assert ("Claude Code", "CLAUDE.md", "alias") in pairs
+    assert ("Gemini CLI", "GEMINI.md", "alias") in pairs
+
+
+def test_public_pattern_unraid_pnpm_exact_path_filter_uses_api_package(
+    tmp_path: Path,
+) -> None:
+    """Pattern observed in unraid/api at d061525: root AGENTS targets ./api."""
+    (tmp_path / "package.json").write_text(
+        json.dumps(
+            {
+                "name": "unraid-monorepo",
+                "private": True,
+                "packageManager": "pnpm@10.15.0",
+                "scripts": {
+                    "test": "pnpm -r test",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+    (tmp_path / "pnpm-workspace.yaml").write_text(
+        'packages:\n  - "./api"\n',
+        encoding="utf-8",
+    )
+    api = tmp_path / "api"
+    api.mkdir()
+    (api / "package.json").write_text(
+        json.dumps(
+            {
+                "name": "@unraid/api",
+                "scripts": {
+                    "test": "NODE_ENV=test vitest run",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "AGENTS.md").write_text(
+        "Run tests with: `pnpm --filter ./api test`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    assert not any(item.kind == "missing-package-script" for item in findings)
+
+
+def test_public_pattern_deer_flow_cd_frontend_uses_frontend_package(
+    tmp_path: Path,
+) -> None:
+    """Pattern observed in bytedance/deer-flow at 5335228: root AGENTS changes cwd."""
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    (frontend / "package.json").write_text(
+        json.dumps(
+            {
+                "name": "deer-flow-frontend",
+                "packageManager": "pnpm@10.26.2",
+                "scripts": {
+                    "check": "eslint . --ext .ts,.tsx && tsc --noEmit",
+                    "test": "rstest",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "AGENTS.md").write_text(
+        "Frontend validation:\n"
+        "```bash\n"
+        "cd frontend && pnpm check\n"
+        "cd frontend && pnpm test\n"
+        "```\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    assert not any(item.kind == "missing-package-script" for item in findings)
+
+
+def test_public_pattern_coral_npm_post_script_prefix_uses_coral_ui(
+    tmp_path: Path,
+) -> None:
+    """Pattern observed in withcoral/coral at 2c58881: npm prefix follows script."""
+    app = tmp_path / "apps" / "coral-ui"
+    app.mkdir(parents=True)
+    (app / "package.json").write_text(
+        json.dumps(
+            {
+                "name": "coral-ui",
+                "scripts": {
+                    "build": "npm run proto:gen && react-router build",
+                    "typecheck": "npm run proto:gen && react-router typegen && tsc",
+                    "test": "npm run proto:gen && vitest run",
+                    "check": "oxfmt --check && oxlint --deny-warnings",
+                    "test:server": "node --test server.test.mjs",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "AGENTS.md").write_text(
+        "Coral UI changes must pass "
+        "`npm run check --prefix apps/coral-ui`, "
+        "`npm run typecheck --prefix apps/coral-ui`, "
+        "`npm test --prefix apps/coral-ui`, and "
+        "`npm run build --prefix apps/coral-ui`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    assert not any(item.kind == "missing-package-script" for item in findings)
+
+
+def test_public_pattern_marktoflow_pnpm_post_script_filter_uses_workspace(
+    tmp_path: Path,
+) -> None:
+    """Pattern observed in marktoflow/marktoflow at 707a57c."""
+    (tmp_path / "package.json").write_text(
+        json.dumps(
+            {
+                "name": "marktoflow",
+                "packageManager": "pnpm@9.15.0",
+                "scripts": {
+                    "test": "turbo run test",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+    for name in ("core", "integrations"):
+        package = tmp_path / "packages" / name
+        package.mkdir(parents=True)
+        (package / "package.json").write_text(
+            json.dumps(
+                {
+                    "name": f"@marktoflow/{name}",
+                    "scripts": {
+                        "test": "vitest run",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+    (tmp_path / "AGENTS.md").write_text(
+        "Core only: `pnpm test --filter=@marktoflow/core`.\n"
+        "Integrations only: `pnpm test --filter=@marktoflow/integrations`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    assert not any(item.kind == "missing-package-script" for item in findings)
+
+
+def test_public_pattern_react_auth_pnpm_recursive_skips_root_script_requirement(
+    tmp_path: Path,
+) -> None:
+    """Pattern observed in forwardsoftware/react-auth at a5fdca1."""
+    (tmp_path / "package.json").write_text(
+        json.dumps(
+            {
+                "packageManager": "pnpm@12.4.0",
+                "scripts": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+    for directory, name in (
+        ("lib", "@forward-software/react-auth"),
+        ("packages/apple-signin", "@forward-software/react-auth-apple"),
+        ("packages/google-signin", "@forward-software/react-auth-google"),
+    ):
+        package = tmp_path / directory
+        package.mkdir(parents=True)
+        (package / "package.json").write_text(
+            json.dumps(
+                {
+                    "name": name,
+                    "scripts": {
+                        "test": "vitest",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+    (tmp_path / "AGENTS.md").write_text(
+        "Run all tests with `pnpm -r test`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    assert not any(item.kind == "missing-package-script" for item in findings)
+
+
+def test_public_pattern_private_hosting_npm_workspaces_skips_root_script_requirement(
+    tmp_path: Path,
+) -> None:
+    """Pattern observed in KutyAI/Private-Hosting-App at 9aa90fb."""
+    (tmp_path / "package.json").write_text(
+        json.dumps(
+            {
+                "name": "mc-hosting-platform",
+                "workspaces": ["apps/*", "packages/*"],
+                "scripts": {
+                    "build": "npm run build --workspaces",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    packages = (
+        ("apps/backend-api", "@mc-host/backend-api", "jest --passWithNoTests"),
+        ("apps/desktop-ui", "@mc-host/desktop-ui", "vitest run"),
+        ("apps/host-agent", "@mc-host/host-agent", "jest --passWithNoTests"),
+        (
+            "apps/relay-service",
+            "@mc-host/relay-service",
+            'echo "No tests declared for relay-service"',
+        ),
+        ("packages/shared-types", "@mc-host/shared-types", "jest --passWithNoTests"),
+    )
+    for directory, name, test_script in packages:
+        package = tmp_path / directory
+        package.mkdir(parents=True)
+        (package / "package.json").write_text(
+            json.dumps(
+                {
+                    "name": name,
+                    "scripts": {
+                        "test": test_script,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+    (tmp_path / "AGENTS.md").write_text(
+        "Run all tests with `npm test --workspaces`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    assert not any(item.kind == "missing-package-script" for item in findings)
+
+
+def test_public_pattern_prompt_kitchen_npm_workspace_directory_selector(
+    tmp_path: Path,
+) -> None:
+    """Pattern observed in kryten87/PromptKitchen at e338c98."""
+    (tmp_path / "package.json").write_text(
+        json.dumps(
+            {
+                "name": "prompt-kitchen",
+                "workspaces": [
+                    "packages/shared",
+                    "packages/backend",
+                    "packages/frontend",
+                    "packages/e2e",
+                ],
+                "scripts": {
+                    "test": "npm run test --workspaces",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    for directory, name, test_script in (
+        (
+            "packages/backend",
+            "@prompt-kitchen/backend",
+            "NODE_OPTIONS=--experimental-vm-modules jest",
+        ),
+        (
+            "packages/frontend",
+            "@prompt-kitchen/frontend",
+            "jest --config jest.config.cjs --no-cache --passWithNoTests",
+        ),
+    ):
+        package = tmp_path / directory
+        package.mkdir(parents=True)
+        (package / "package.json").write_text(
+            json.dumps(
+                {
+                    "name": name,
+                    "scripts": {
+                        "test": test_script,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+    (tmp_path / "AGENTS.md").write_text(
+        "Backend: `npm --workspace=packages/backend test -- path/to/test.spec.ts`.\n"
+        "Frontend: `npm --workspace=packages/frontend test -- path/to/test.spec.tsx`.\n",
+        encoding="utf-8",
+    )
+
+    findings = lint_instructions(tmp_path)
+
+    assert not any(item.kind == "missing-package-script" for item in findings)
+
+
+
+
+def test_public_pattern_plexe_poetry_ruff_claude_alias(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Pattern observed in plexe-ai/plexe at a1e05f6: Poetry/Ruff + Claude alias."""
+    agents = tmp_path / "AGENTS.md"
+    agents.write_text(
+        "# Agent instructions\n\n"
+        "This file is the canonical agent guidance. CLAUDE.md aliases this file.\n\n"
+        "Validate changes with `poetry run pytest tests/unit/` and "
+        "`poetry run ruff check . --fix`.\n",
+        encoding="utf-8",
+    )
+
+    claude = tmp_path / "CLAUDE.md"
+    claude.write_text("AGENTS.md", encoding="utf-8")
+
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.poetry]\n"
+        'name = "plexe"\n'
+        'version = "0.0.0"\n'
+        "\n"
+        "[tool.poetry.group.dev.dependencies]\n"
+        'pytest = "^8.0"\n'
+        'ruff = "^0.12"\n',
+        encoding="utf-8",
+    )
+
+    original_is_symlink = Path.is_symlink
+    original_readlink = Path.readlink
+
+    def fake_is_symlink(path: Path) -> bool:
+        if path == claude:
+            return True
+        return original_is_symlink(path)
+
+    def fake_readlink(path: Path) -> Path:
+        if path == claude:
+            return Path("AGENTS.md")
+        return original_readlink(path)
+
+    monkeypatch.setattr(Path, "is_symlink", fake_is_symlink)
+    monkeypatch.setattr(Path, "readlink", fake_readlink)
+
+    signals = detect_instruction_signals(tmp_path)
+    pairs = {(item.tool, item.path, item.kind) for item in signals}
+
+    assert ("Codex / OpenAI agents", "AGENTS.md", "repository") in pairs
+    assert ("Claude Code", "CLAUDE.md", "alias") in pairs
+
+    commands = extract_commands(agents.read_text(encoding="utf-8"))
+    assert "poetry run pytest tests/unit/" in commands
+    assert "poetry run ruff check . --fix" in commands
+
+    findings = lint_instructions(tmp_path, signals)
+
+    assert not any(item.kind == "validation-command-drift" for item in findings)
+    assert not any(item.kind == "package-manager-drift" for item in findings)
+    assert not any(item.kind == "package-manager-mismatch" for item in findings)
+
+
+
+def test_public_pattern_c2fo_windsurf_always_on_is_repository_rule(
+    tmp_path: Path,
+) -> None:
+    """Pattern observed in C2FO/vfs at 80e2c9f: Windsurf always_on rule."""
+    rules = tmp_path / ".windsurf" / "rules"
+    rules.mkdir(parents=True)
+    (rules / "standards.md").write_text(
+        "---\ntrigger: always_on\ndescription:\nglobs:\n---\n"
+        "# VFS Development Standards\n",
+        encoding="utf-8",
+    )
+
+    signal = next(
+        item
+        for item in detect_instruction_signals(tmp_path)
+        if item.path == ".windsurf/rules/standards.md"
+    )
+
+    assert signal.tool == "Windsurf"
+    assert signal.kind == "repository"
+    assert signal.scope == "."
+
+
+def test_public_pattern_betterrtx_windsurf_glob_is_path_specific(
+    tmp_path: Path,
+) -> None:
+    """Pattern observed in BetterRTX/BetterRTX-Installer at f1d8682."""
+    rules = tmp_path / ".windsurf" / "rules"
+    rules.mkdir(parents=True)
+    (rules / "css.md").write_text(
+        "---\ntrigger: glob\nglobs: **/*.css,**/*.tsx\n---\n"
+        "# Project Code Style - CSS / Tailwind\n",
+        encoding="utf-8",
+    )
+
+    signal = next(
+        item
+        for item in detect_instruction_signals(tmp_path)
+        if item.path == ".windsurf/rules/css.md"
+    )
+
+    assert signal.tool == "Windsurf"
+    assert signal.kind == "path-specific"
+
+
+def test_public_pattern_dxos_windsurf_model_decision_is_conditional(
+    tmp_path: Path,
+) -> None:
+    """Pattern observed in dxos/dxos at 605455c: model_decision + package.json."""
+    rules = tmp_path / ".windsurf" / "rules"
+    rules.mkdir(parents=True)
+    (rules / "pnpm.md").write_text(
+        "---\ntrigger: model_decision\ndescription:\nglobs: package.json\n---\n"
+        "Use §pnpm install§ to install new packages.\n".replace("§", "`"),
+        encoding="utf-8",
+    )
+
+    signal = next(
+        item
+        for item in detect_instruction_signals(tmp_path)
+        if item.path == ".windsurf/rules/pnpm.md"
+    )
+    findings = lint_instructions(tmp_path)
+
+    assert signal.tool == "Windsurf"
+    assert signal.kind == "conditional"
+    assert not any(item.kind == "package-manager-drift" for item in findings)

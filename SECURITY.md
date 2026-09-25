@@ -32,6 +32,39 @@ Do not include real credentials, private repository contents, or unrelated sensi
 
 ## Scope
 
-The CLI performs local repository and toolchain inspection. The core audit path is designed not to transmit repository contents over the network. Repository instruction/configuration and project-marker inputs are not trusted through symbolic links, and write operations refuse symlinked `AGENTS.md` targets.
+The CLI performs local repository and toolchain inspection. The core audit path is designed not to transmit repository contents over the network. Repository instruction/configuration and project-marker contents are not trusted through symbolic links, and write operations refuse symlinked `AGENTS.md` targets. The detector may recognize the exact lexical aliases `CLAUDE.md -> AGENTS.md` and `GEMINI.md -> AGENTS.md` (or `./AGENTS.md`) only when the sibling `AGENTS.md` is a regular non-symlink file; it reads that regular file directly and never follows either alias for instruction content. A Gemini alias is recognized only when `GEMINI.md` is in the effective Gemini context filename list.
 
 Secret-risk detection is filename-based and is not a replacement for dedicated secret or vulnerability scanners. A passing result is not a security guarantee.
+
+Repository-level `.cwb.json` suppressions are deliberately fail-closed. The file must be a regular non-symlink root file, every suppression requires a reason, instruction suppressions use exact repository-relative paths, and blocking checks, essential readiness checks, tracked secret-risk findings, and error-severity instruction findings cannot be suppressed. Invalid configuration remains visible as a `configuration` warning rather than silently weakening preflight. The GitHub App evaluates `.cwb.json` from the inspected revision, so changes to this file are repository-policy changes and should receive the same review attention as CI configuration. When suppressions are applied, the Check Run annotates `.cwb.json` and includes the recorded reasons in its report.
+
+## GitHub App credentials
+
+The GitHub App uses an App private key, a webhook secret, and short-lived installation access tokens. Treat all of them as credentials.
+
+- Never commit a GitHub App private key, webhook secret, installation token, manifest-conversion response, or populated local environment file.
+- Store the private key and webhook secret using a secret-management mechanism appropriate to the deployment platform.
+- Keep the App registration on the documented minimum repository permissions: Checks read/write, Contents read-only, and Pull requests read-only.
+- Verify every webhook with `X-Hub-Signature-256` before parsing or acting on its payload.
+- Installation tokens should be created only for the installation that delivered the event and should not be logged. The worker further restricts each token to the single event repository and only the `contents:read` and `checks:write` permissions needed after webhook receipt.
+- Pull request code is untrusted input. The GitHub App checkout path disables system/global Git configuration and Git hooks, does not initialize submodules, and never executes project validation commands from the checked-out repository.
+- HTTP Git access follows GitHub's installation-token contract: the token is supplied as the password for the `x-access-token` username via an environment-backed Basic-auth extraheader. The token is never embedded in the remote URL or command-line arguments.
+- A dynamic branch or pull-request ref is accepted only when it resolves to the SHA expected from the webhook event.
+
+The preferred zero-cost Cloudflare deployment stores Manifest-generated GitHub App credentials in Workers KV. Cloudflare encrypts all KV values at rest with AES-256 and protects transport with TLS. The App private key and webhook secret never enter the GitHub Actions runner.
+
+The zero-cost deployment is public-repository-only. Private-repository webhook events are rejected at the Cloudflare gateway before queueing, preventing private repository names, SHAs, and code from entering a public GitHub Actions run.
+
+The Cloudflare installation-token broker accepts GitHub Actions OIDC only after verifying GitHub's signature, an audience equal to the exact Worker `/tokens/github` endpoint that received the request, repository, main-branch ref, `workflow_dispatch` event, and exact `.github/workflows/github-app-worker.yml` workflow identity. It also requires an HMAC broker grant derived from the verified webhook secret and bound to the delivery ID plus the complete normalized scan target, including the commit SHA and pull-request/ref metadata. Tokens returned to Actions are limited to the single webhook repository and only `contents:read` + `checks:write`.
+
+The Cloudflare workflow-dispatch credential must be a fine-grained personal access token restricted to `kohli217/codex-workspace-bootstrap` with Actions write only. It is uploaded once as the Worker secret `CWB_DISPATCH_TOKEN` and is never read back by the deployment script. The Worker uses it only to start the dedicated workflow dispatch. The token must never be committed or logged.
+
+The reference Cloud Run deployment further separates credentials by service identity: the public ingress can read the webhook/setup secrets and add new Manifest-generated secret versions, while the private worker can read only the App client ID and private key. Pub/Sub invokes the worker through Cloud Run IAM rather than a public worker endpoint.
+
+The Manifest setup endpoint requires a bootstrap token before it will render or accept a GitHub App registration callback. Setup tokens embed their issuance time and expire after one hour. The deployment prints the token in a URL fragment rather than a query string; browser fragments are not sent to Cloud Run. The bootstrap page POSTs the token in the request body, and only the verified server-side secret value is copied into a Secure/HttpOnly cookie. Response header values reject CR/LF characters.
+
+The production image copies only the package metadata and `src/` tree, and `.dockerignore` excludes Git history, tests, local environments, reports, and common credential filenames from the Docker build context.
+
+The repository ignores common private-key and local-secret filenames, but ignore rules are not a substitute for secure credential storage.
+
+The Cloudflare GitHub App Manifest callback uses an HMAC-signed, one-hour `state` value derived from the one-hour setup secret. The callback verifies the signature and timestamp directly, so it does not depend on cross-site cookie delivery or eventually consistent KV reads after GitHub redirects back to the Worker. A compatibility-only recovery path for callbacks issued by older deployments still requires a currently valid setup session before the old one-time GitHub Manifest code can be exchanged.

@@ -10,8 +10,9 @@ from .agents import generate_agents
 from .audit import audit_repository, summary
 from .doctor import doctor_findings
 from .fixes import apply_fix_plan, build_fix_plan
-from .preflight import build_preflight, render_markdown
+from .preflight import build_preflight, evaluate_preflight_policy, render_markdown
 from .sarif import checks_to_sarif, preflight_report_to_sarif
+from .schemas import schema_document
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -46,6 +47,11 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Return a non-zero exit code unless the preflight state is READY",
     )
+    preflight.add_argument(
+        "--repository-only",
+        action="store_true",
+        help="Skip local toolchain availability checks and evaluate repository evidence only",
+    )
 
     fix = sub.add_parser("fix", help="Preview safe repository-readiness fixes")
     fix.add_argument("path", nargs="?", default=".")
@@ -72,6 +78,16 @@ def _parser() -> argparse.ArgumentParser:
     init_agents.add_argument("path", nargs="?", default=".")
     init_agents.add_argument("--force", action="store_true", help="Overwrite an existing AGENTS.md")
 
+    schema = sub.add_parser(
+        "schema",
+        help="Print a stable machine-readable JSON Schema contract",
+    )
+    schema.add_argument(
+        "kind",
+        choices=("preflight", "config"),
+        help="Schema to print: preflight report or .cwb.json repository config",
+    )
+
     return parser
 
 
@@ -91,13 +107,17 @@ def _run_preflight(
     strict: bool,
     fail_on_integrity: bool,
     require_ready: bool,
+    repository_only: bool,
 ) -> int:
     root = Path(path).expanduser().resolve()
     if not root.exists() or not root.is_dir():
         print(f"error: repository path does not exist or is not a directory: {root}", file=sys.stderr)
         return 2
 
-    report = build_preflight(root)
+    report = build_preflight(
+        root,
+        include_local_toolchain=not repository_only,
+    )
 
     print("AI Repository Preflight")
     print(f"Repository: {root}")
@@ -128,6 +148,32 @@ def _run_preflight(
         f"{instruction_totals['invalid_commands']} invalid commands, "
         f"{instruction_totals['metadata']} metadata"
     )
+
+    configuration = report.get("configuration")
+    if isinstance(configuration, dict):
+        if configuration.get("valid"):
+            print(
+                "Repository config: "
+                f"{configuration.get('path', '.cwb.json')} "
+                f"(version {configuration.get('version', '?')})"
+            )
+        else:
+            print(
+                "Repository config: INVALID - "
+                f"{configuration.get('error', 'unknown configuration error')}"
+            )
+
+        suppressions = report.get("suppressions", [])
+        if isinstance(suppressions, list) and suppressions:
+            applied = sum(
+                1
+                for item in suppressions
+                if isinstance(item, dict) and item.get("applied")
+            )
+            print(
+                f"Suppressions: {applied} applied, "
+                f"{len(suppressions) - applied} unused"
+            )
 
     findings = report["instruction_findings"]
     if findings:
@@ -163,13 +209,13 @@ def _run_preflight(
             "Preflight SARIF report",
         )
 
-    if strict and report["state"] == "BLOCKED":
-        return 1
-    if fail_on_integrity and report["instruction_summary"]["findings"]:
-        return 1
-    if require_ready and report["state"] != "READY":
-        return 1
-    return 0
+    decision = evaluate_preflight_policy(
+        report,
+        strict=strict,
+        fail_on_integrity=fail_on_integrity,
+        require_ready=require_ready,
+    )
+    return 0 if decision.passed else 1
 
 
 def _run_fix(path: str, apply: bool) -> int:
@@ -271,6 +317,11 @@ def _run_doctor(path: str) -> int:
     print("Doctor is diagnostic only; it did not install software or modify configuration.")
     return 0
 
+def _run_schema(kind: str) -> int:
+    print(json.dumps(schema_document(kind), indent=2, sort_keys=True))
+    return 0
+
+
 def _run_init_agents(path: str, force: bool) -> int:
     root = Path(path).expanduser().resolve()
     if not root.exists() or not root.is_dir():
@@ -301,6 +352,7 @@ def main(argv: list[str] | None = None) -> int:
             args.strict,
             args.fail_on_integrity,
             args.require_ready,
+            args.repository_only,
         )
     if args.command == "fix":
         return _run_fix(args.path, args.apply)
@@ -310,4 +362,6 @@ def main(argv: list[str] | None = None) -> int:
         return _run_doctor(args.path)
     if args.command == "init-agents":
         return _run_init_agents(args.path, args.force)
+    if args.command == "schema":
+        return _run_schema(args.kind)
     return 2

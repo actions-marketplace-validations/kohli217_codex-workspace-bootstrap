@@ -1,9 +1,11 @@
 from pathlib import Path
+import json
 import shutil
 import subprocess
 
 import pytest
 
+from codex_workspace_bootstrap import __version__
 from codex_workspace_bootstrap.cli import main
 
 
@@ -101,7 +103,29 @@ def test_version_flag_reports_package_version(capsys: pytest.CaptureFixture[str]
         main(["--version"])
 
     assert exc_info.value.code == 0
-    assert "codex-workspace-bootstrap 0.7.0" in capsys.readouterr().out
+    assert f"codex-workspace-bootstrap {__version__}" in capsys.readouterr().out
+
+
+def test_schema_command_prints_preflight_contract(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code = main(["schema", "preflight"])
+
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["title"] == "CWB preflight report v1"
+    assert payload["properties"]["schema_version"]["const"] == 1
+
+
+def test_schema_command_prints_config_contract(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code = main(["schema", "config"])
+
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["title"] == "CWB repository configuration v1"
+    assert payload["properties"]["version"]["const"] == 1
 
 
 def test_audit_writes_sarif(tmp_path: Path) -> None:
@@ -358,5 +382,36 @@ def test_preflight_require_ready_succeeds_for_ready_repository(tmp_path: Path) -
     (tmp_path / "AGENTS.md").write_text("# agents\n", encoding="utf-8")
 
     code = main(["preflight", str(tmp_path), "--require-ready"])
+
+    assert code == 0
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git is required")
+def test_preflight_repository_only_cli_skips_local_toolchain(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    subprocess.run(
+        ("git", "-C", str(tmp_path), "init"),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (tmp_path / "README.md").write_text("# demo\n", encoding="utf-8")
+    (tmp_path / ".gitignore").write_text(".venv/\n", encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='demo'\n", encoding="utf-8")
+    (tmp_path / "AGENTS.md").write_text("# agents\n", encoding="utf-8")
+
+    def fail_tool_check(label: str, command: tuple[str, ...]):
+        raise AssertionError(f"local tool check should not run: {label} {command}")
+
+    monkeypatch.setattr("codex_workspace_bootstrap.audit._tool_check", fail_tool_check)
+
+    code = main([
+        "preflight",
+        str(tmp_path),
+        "--repository-only",
+        "--require-ready",
+    ])
 
     assert code == 0
